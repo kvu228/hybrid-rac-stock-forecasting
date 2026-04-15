@@ -1,0 +1,831 @@
+Here are some best practices and rules you must follow:
+
+- You use Python 3.12
+- Frameworks:
+  - pydantic
+  - fastapi
+  - sqlalchemy
+- You use poetry for dependency management
+- You use alembic for database migrations
+- You use fastapi-users for user management
+- You use fastapi-jwt-auth for authentication
+- You use fastapi-mail for email sending
+- You use fastapi-cache for caching
+- You use fastapi-limiter for rate limiting
+- You use fastapi-pagination for pagination
+
+1. **Use Meaningful Names**: Choose descriptive variable, function, and class names.
+2. **Follow PEP 8**: Adhere to the Python Enhancement Proposal 8 style guide for formatting.
+3. **Use Docstrings**: Document functions and classes with docstrings to explain their purpose.
+4. **Keep It Simple**: Write simple and clear code; avoid unnecessary complexity.
+5. **Use List Comprehensions**: Prefer list comprehensions for creating lists over traditional loops when appropriate.
+6. **Handle Exceptions**: Use try-except blocks to handle exceptions gracefully.
+7. **Use Virtual Environments**: Isolate project dependencies using virtual environments (e.g., `venv`).
+8. **Write Tests**: Implement unit tests to ensure code reliability.
+9. **Use Type Hints**: Utilize type hints for better code clarity and type checking.
+10. **Avoid Global Variables**: Limit the use of global variables to reduce side effects.
+
+These rules will help you write clean, efficient, and maintainable Python code.
+
+# PROJECT CONTEXT — Hybrid-RAC-Stock
+
+> **Đề tài:** Hệ thống nhận diện mẫu hình và dự báo chứng khoán dựa trên kiến trúc Cơ sở dữ liệu lai (TimescaleDB & pgvector)
+> **Môn học:** Cơ sở dữ liệu nâng cao (Advanced Databases) — Chương trình Thạc sĩ CNTT
+> **Trọng tâm kỹ thuật:** Database Engineering, KHÔNG phải AI/Deep Learning
+
+---
+
+## 1. BỐI CẢNH VÀ BÀI TOÁN
+
+### 1.1 Vấn đề cần giải quyết
+
+Dự báo chuỗi thời gian tài chính đối mặt ba rào cản kỹ thuật ở tầng cơ sở dữ liệu:
+
+**Index Bloat trên B-Tree:** Dữ liệu OHLCV có tính chất append-only với khóa thời gian tăng đơn điệu (monotonic). B-Tree truyền thống gây phình to chỉ mục khi bảng vượt ngưỡng bộ nhớ đệm, dẫn đến suy giảm I/O theo hàm mũ — đặc biệt nghiêm trọng khi dữ liệu đạt hàng triệu bản ghi.
+
+**SQL không hỗ trợ tính toán khoảng cách vector:** Bài toán nhận diện mẫu hình tương đồng yêu cầu tìm kiếm láng giềng gần nhất (KNN) trong không gian 128 chiều. Các toán tử đại số tuyến tính của SQL truyền thống không hỗ trợ tự nhiên cho phép tính cosine similarity hay L2 distance trên vector.
+
+**Vấn đề hộp đen (Black-Box):** Các mô hình deep learning đưa ra dự báo nhưng không trích xuất được nguồn gốc dữ liệu (data provenance) để kiểm chứng. Thiếu cơ chế giải thích tại sao một dự báo được đưa ra.
+
+### 1.2 Giải pháp đề xuất
+
+Kiến trúc **Hybrid Storage** trên PostgreSQL 16+ kết hợp:
+- **TimescaleDB** → quản lý chuỗi thời gian OHLCV (Hypertable, Chunking, Column Compression)
+- **pgvector** → lưu trữ và tìm kiếm vector embedding 128 chiều (HNSW Index)
+- **RAC (Retrieval-Augmented Classification)** → truy xuất mẫu hình lịch sử tương đồng làm bằng chứng định lượng cho dự báo, giải quyết vấn đề hộp đen
+
+Tất cả cùng chạy trên **một instance PostgreSQL duy nhất** — không đồng bộ giữa nhiều hệ thống.
+
+---
+
+## 2. KIẾN TRÚC HỆ THỐNG
+
+### 2.1 Tổng quan kiến trúc
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     APPLICATION LAYER (Python)                  │
+│   Vnstock ETL │ 1D-CNN Encoder │ SVM Classifier │ RAC Engine   │
+└──────┬────────────────┬──────────────────┬──────────────────────┘
+       │                │                  │
+       ▼                ▼                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   PostgreSQL 16+ Instance                       │
+│                                                                 │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
+│  │   TimescaleDB    │  │    pgvector      │  │  Stored Procs │  │
+│  │                  │  │                  │  │  (In-DB       │  │
+│  │  • Hypertable    │  │  • vector(128)   │  │   Computing)  │  │
+│  │  • Auto-Chunk    │  │  • HNSW Index    │  │               │  │
+│  │  • Compression   │  │  • Cosine Sim    │  │  • K-NN Stats │  │
+│  │  • Cont. Agg.    │  │  • Hybrid Search │  │  • Context    │  │
+│  │                  │  │                  │  │    Enrichment │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘  │
+│                                                                 │
+│  Indexes: B-Tree (symbol, time) + HNSW (embedding vector)       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Data Flow (Pipeline)
+
+```
+Raw OHLCV (Vnstock/VCI API)
+    │
+    ▼
+[1] ETL & Ingestion ──→ TimescaleDB Hypertable (stock_ohlcv)
+    │                     • Chunk interval: tunable (1 week default)
+    │                     • Compression policy: segments > N days
+    │
+    ▼
+[2] Preprocessing
+    │  • Alignment theo trading calendar
+    │  • Forward-fill giá, xử lý volume riêng
+    │  • Z-score normalization per window
+    │  • Relative return transformation
+    │
+    ▼
+[2.5] Metadata Extraction (S/R Zones)
+    │  • Thuật toán dò tìm các điểm đảo chiều (Pivot Points/K-Means trên giá)
+    │  • Lưu trữ mức giá Hỗ trợ (Support) và Kháng cự (Resistance)
+    │  • Tính toán trọng số (strength) dựa trên số lần giá test vùng này
+    │
+    ▼
+[3] Sliding Window (30 sessions)
+    │  • Tensor đầu vào: [30 × 5] (OHLCV channels)
+    │  • Stride: 1 (overlap tối đa)
+    │
+    ▼
+[4] 1D-CNN Encoder ──→ Embedding vector(128)
+    │                     • Lưu vào bảng pattern_embeddings
+    │                     • Indexed bằng HNSW
+    │
+    ▼
+[5] RAC Pipeline (tại query time)
+    │  a. Input: embedding của window hiện tại
+    │  b. pgvector KNN search (cosine similarity, K=10..50)
+    │  c. Stored Procedure tính thống kê K-láng giềng
+    │  d. Context Enrichment → feature vector mở rộng
+    │  e. SVM Classifier → dự báo + bằng chứng lịch sử
+    │
+    ▼
+[6] Output: Prediction + Top-K similar historical patterns (explainable)
+```
+
+---
+
+## 3. DATABASE SCHEMA
+
+### 3.1 Bảng chính
+
+```sql
+-- Extension setup
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ============================================================
+-- BẢNG 1: Dữ liệu OHLCV (TimescaleDB Hypertable)
+-- ============================================================
+CREATE TABLE stock_ohlcv (
+    time        TIMESTAMPTZ     NOT NULL,
+    symbol      TEXT            NOT NULL,
+    open        DOUBLE PRECISION NOT NULL,
+    high        DOUBLE PRECISION NOT NULL,
+    low         DOUBLE PRECISION NOT NULL,
+    close       DOUBLE PRECISION NOT NULL,
+    volume      BIGINT          NOT NULL
+);
+
+-- Chuyển thành hypertable, chunk theo time
+SELECT create_hypertable('stock_ohlcv', 'time',
+    chunk_time_interval => INTERVAL '1 month'
+);
+
+-- Index composite cho truy vấn theo symbol + time range
+CREATE INDEX idx_ohlcv_symbol_time
+    ON stock_ohlcv (symbol, time DESC);
+
+-- Compression policy (nén chunk cũ hơn 3 tháng)
+ALTER TABLE stock_ohlcv SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'symbol',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('stock_ohlcv', INTERVAL '90 days');
+
+-- ============================================================
+-- BẢNG 2: Pattern Embeddings (pgvector)
+-- ============================================================
+CREATE TABLE pattern_embeddings (
+    id              BIGSERIAL       PRIMARY KEY,
+    symbol          TEXT            NOT NULL,
+    window_start    TIMESTAMPTZ     NOT NULL,
+    window_end      TIMESTAMPTZ     NOT NULL,
+    embedding       vector(128)     NOT NULL,
+    label           SMALLINT,           -- 0: down, 1: neutral, 2: up (T+5)
+    future_return   DOUBLE PRECISION,   -- actual return at T+5
+    created_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+
+-- HNSW Index cho cosine similarity search
+CREATE INDEX idx_embedding_hnsw
+    ON pattern_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- B-Tree index cho filtered search (Hybrid Search)
+CREATE INDEX idx_embedding_symbol
+    ON pattern_embeddings (symbol);
+
+CREATE INDEX idx_embedding_label
+    ON pattern_embeddings (label);
+
+-- ============================================================
+-- BẢNG 3: RAC Results (lưu kết quả dự báo + bằng chứng)
+-- ============================================================
+CREATE TABLE rac_predictions (
+    id              BIGSERIAL       PRIMARY KEY,
+    query_embedding_id  BIGINT      REFERENCES pattern_embeddings(id),
+    predicted_label     SMALLINT    NOT NULL,
+    confidence_score    DOUBLE PRECISION,
+    k_neighbors         INTEGER     NOT NULL,
+    avg_neighbor_dist   DOUBLE PRECISION,
+    neighbor_label_dist JSONB,          -- {"0": 3, "1": 2, "2": 5}
+    neighbor_ids        BIGINT[],       -- array of matched embedding IDs
+    predicted_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================
+-- BẢNG 4: Metadata & Vùng giá nhạy cảm (S/R Zones)
+-- Mục đích: Làm giàu dữ liệu ngữ cảnh (Context Enrichment) cho RAC
+-- ============================================================
+CREATE TABLE support_resistance_zones (
+    id              SERIAL          PRIMARY KEY,
+    symbol          TEXT            NOT NULL,
+    zone_type       VARCHAR(10)     NOT NULL, -- 'SUPPORT' hoặc 'RESISTANCE'
+    price_level     DOUBLE PRECISION NOT NULL,
+    strength        DOUBLE PRECISION,         -- Mật độ điểm đảo chiều / Trọng số
+    detected_at     TIMESTAMPTZ     DEFAULT NOW(),
+    is_active       BOOLEAN         DEFAULT TRUE
+);
+
+-- B-Tree Index tối ưu truy vấn khoảng cách giá theo từng mã
+CREATE INDEX idx_sr_symbol_active 
+    ON support_resistance_zones(symbol) 
+    WHERE is_active = TRUE;
+```
+
+### 3.2 Stored Procedures (In-DB Computing)
+
+```sql
+-- ============================================================
+-- Stored Procedure: Tìm K-láng giềng + tính thống kê
+-- Mục đích: Giảm tải network I/O bằng cách tính toán
+--           trực tiếp trên DB thay vì trả raw vectors về app
+-- ============================================================
+CREATE OR REPLACE FUNCTION find_similar_patterns(
+    query_vec       vector(128),
+    k_neighbors     INTEGER DEFAULT 20,
+    similarity_threshold DOUBLE PRECISION DEFAULT 0.7,
+    filter_symbol   TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    neighbor_id         BIGINT,
+    neighbor_symbol     TEXT,
+    neighbor_label      SMALLINT,
+    neighbor_return     DOUBLE PRECISION,
+    cosine_distance     DOUBLE PRECISION,
+    window_start        TIMESTAMPTZ,
+    window_end          TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        pe.id,
+        pe.symbol,
+        pe.label,
+        pe.future_return,
+        (pe.embedding <=> query_vec) AS cos_dist,
+        pe.window_start,
+        pe.window_end
+    FROM pattern_embeddings pe
+    WHERE (filter_symbol IS NULL OR pe.symbol = filter_symbol)
+      AND (pe.embedding <=> query_vec) < (1.0 - similarity_threshold)
+    ORDER BY pe.embedding <=> query_vec
+    LIMIT k_neighbors;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Stored Procedure: Context Enrichment
+-- Tính toán thống kê tổng hợp từ K-láng giềng
+-- ============================================================
+CREATE OR REPLACE FUNCTION compute_rac_context(
+    query_vec       vector(128),
+    k_neighbors     INTEGER DEFAULT 20
+)
+RETURNS TABLE (
+    total_neighbors     INTEGER,
+    avg_cosine_dist     DOUBLE PRECISION,
+    label_distribution  JSONB,
+    avg_future_return   DOUBLE PRECISION,
+    stddev_future_return DOUBLE PRECISION,
+    dominant_label      SMALLINT,
+    confidence          DOUBLE PRECISION
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH neighbors AS (
+        SELECT
+            pe.label,
+            pe.future_return,
+            (pe.embedding <=> query_vec) AS cos_dist
+        FROM pattern_embeddings pe
+        ORDER BY pe.embedding <=> query_vec
+        LIMIT k_neighbors
+    ),
+    label_counts AS (
+        SELECT
+            label,
+            COUNT(*)::INTEGER AS cnt
+        FROM neighbors
+        GROUP BY label
+    )
+    SELECT
+        COUNT(*)::INTEGER,
+        AVG(n.cos_dist),
+        jsonb_object_agg(lc.label::TEXT, lc.cnt),
+        AVG(n.future_return),
+        STDDEV(n.future_return),
+        (SELECT lc2.label FROM label_counts lc2
+         ORDER BY lc2.cnt DESC LIMIT 1),
+        (SELECT MAX(lc3.cnt)::DOUBLE PRECISION / k_neighbors
+         FROM label_counts lc3)
+    FROM neighbors n
+    CROSS JOIN (SELECT 1) dummy
+    LEFT JOIN label_counts lc ON TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Stored Procedure: Tính khoảng cách đến S/R Zone gần nhất
+-- ============================================================
+CREATE OR REPLACE FUNCTION get_distance_to_nearest_sr(
+    p_symbol        TEXT,
+    p_current_price DOUBLE PRECISION
+)
+RETURNS TABLE (
+    dist_to_support     DOUBLE PRECISION,
+    dist_to_resistance  DOUBLE PRECISION
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        (SELECT MIN(ABS(p_current_price - price_level)) 
+         FROM support_resistance_zones 
+         WHERE symbol = p_symbol AND zone_type = 'SUPPORT' AND is_active = TRUE),
+        (SELECT MIN(ABS(price_level - p_current_price)) 
+         FROM support_resistance_zones 
+         WHERE symbol = p_symbol AND zone_type = 'RESISTANCE' AND is_active = TRUE);
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- Stored Procedure: HYBRID RAC CONTEXT (★ Core của kiến trúc Hybrid)
+-- 
+-- Kết hợp trong MỘT lần round-trip duy nhất:
+--   1. HNSW vector search (pgvector)  → "Hình dáng tương đồng"
+--   2. B-Tree metadata lookup (S/R)   → "Ngữ cảnh vị trí giá"
+--   3. Thống kê tổng hợp K-láng giềng → "Bằng chứng định lượng"
+--
+-- Đây là minh chứng trực tiếp cho Hybrid Query:
+--   HNSW Index Scan + B-Tree Index Scan trong cùng execution plan
+-- ============================================================
+CREATE OR REPLACE FUNCTION compute_full_rac_context(
+    query_vec       vector(128),
+    p_symbol        TEXT,
+    p_current_price DOUBLE PRECISION,
+    k_neighbors     INTEGER DEFAULT 20
+)
+RETURNS TABLE (
+    -- Block 1: Thống kê KNN (từ HNSW search)
+    total_neighbors         INTEGER,
+    avg_cosine_dist         DOUBLE PRECISION,
+    label_distribution      JSONB,
+    avg_future_return       DOUBLE PRECISION,
+    stddev_future_return    DOUBLE PRECISION,
+    dominant_label          SMALLINT,
+    knn_confidence          DOUBLE PRECISION,
+    -- Block 2: Metadata S/R (từ B-Tree lookup)
+    dist_to_support         DOUBLE PRECISION,
+    dist_to_resistance      DOUBLE PRECISION,
+    sr_position_ratio       DOUBLE PRECISION,   -- vị trí tương đối trong kênh S/R
+    -- Block 3: Danh sách neighbor IDs (để truy xuất bằng chứng)
+    neighbor_ids            BIGINT[]
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH 
+    -- ═══ PHASE 1: HNSW Index Scan trên pgvector ═══
+    knn AS (
+        SELECT
+            pe.id,
+            pe.label,
+            pe.future_return,
+            (pe.embedding <=> query_vec) AS cos_dist
+        FROM pattern_embeddings pe
+        ORDER BY pe.embedding <=> query_vec
+        LIMIT k_neighbors
+    ),
+    knn_stats AS (
+        SELECT
+            COUNT(*)::INTEGER                       AS n_total,
+            AVG(cos_dist)                           AS avg_dist,
+            AVG(future_return)                      AS avg_ret,
+            STDDEV(future_return)                    AS std_ret,
+            ARRAY_AGG(id ORDER BY cos_dist)          AS ids
+        FROM knn
+    ),
+    knn_labels AS (
+        SELECT
+            label,
+            COUNT(*)::INTEGER AS cnt
+        FROM knn
+        GROUP BY label
+    ),
+    knn_dominant AS (
+        SELECT
+            label AS dom_label,
+            cnt::DOUBLE PRECISION / (SELECT n_total FROM knn_stats) AS conf
+        FROM knn_labels
+        ORDER BY cnt DESC
+        LIMIT 1
+    ),
+
+    -- ═══ PHASE 2: B-Tree Index Scan trên S/R Zones ═══
+    sr_data AS (
+        SELECT
+            (SELECT MIN(ABS(p_current_price - price_level))
+             FROM support_resistance_zones
+             WHERE symbol = p_symbol 
+               AND zone_type = 'SUPPORT' 
+               AND is_active = TRUE
+            ) AS d_support,
+            (SELECT MIN(ABS(price_level - p_current_price))
+             FROM support_resistance_zones
+             WHERE symbol = p_symbol 
+               AND zone_type = 'RESISTANCE' 
+               AND is_active = TRUE
+            ) AS d_resistance
+    )
+
+    -- ═══ PHASE 3: Tổng hợp kết quả ═══
+    SELECT
+        ks.n_total,
+        ks.avg_dist,
+        (SELECT jsonb_object_agg(kl.label::TEXT, kl.cnt) FROM knn_labels kl),
+        ks.avg_ret,
+        ks.std_ret,
+        kd.dom_label,
+        kd.conf,
+        sr.d_support,
+        sr.d_resistance,
+        -- Tỷ lệ vị trí: 0.0 = sát support, 1.0 = sát resistance
+        CASE 
+            WHEN sr.d_support IS NOT NULL AND sr.d_resistance IS NOT NULL 
+                 AND (sr.d_support + sr.d_resistance) > 0
+            THEN sr.d_support / (sr.d_support + sr.d_resistance)
+            ELSE NULL
+        END,
+        ks.ids
+    FROM knn_stats ks
+    CROSS JOIN knn_dominant kd
+    CROSS JOIN sr_data sr;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+---
+
+## 4. CẤU TRÚC THƯ MỤC DỰ KIẾN
+
+```
+hybrid-rac-stock/
+│
+├── PROJECT_CONTEXT.md          ← File này
+├── README.md
+├── requirements.txt
+├── .env.example                ← DB connection string, API keys
+│
+├── config/
+│   ├── db_config.py            ← PostgreSQL connection, pool settings
+│   ├── model_config.py         ← CNN hyperparams, SVM params
+│   └── tuning_config.py        ← HNSW params (m, ef_construction, ef_search)
+│
+├── db/
+│   ├── migrations/
+│   │   ├── 001_create_extensions.sql
+│   │   ├── 002_create_hypertable.sql
+│   │   ├── 003_create_embeddings_table.sql
+│   │   ├── 004_create_hnsw_index.sql
+│   │   └── 005_create_stored_procedures.sql
+│   ├── seeds/
+│   │   └── seed_sample_data.py
+│   └── tuning/
+│       ├── chunk_interval_benchmark.sql
+│       ├── hnsw_param_sweep.sql        ← Benchmark m, ef_construction
+│       └── compression_analysis.sql
+│
+├── etl/
+│   ├── vnstock_fetcher.py      ← Thu thập OHLCV từ VCI qua Vnstock
+│   ├── data_cleaner.py         ← Align trading calendar, forward-fill
+│   ├── feature_engineer.py     ← Z-score, relative return, sliding window
+│   └── ingestion.py            ← Bulk COPY vào TimescaleDB
+│
+├── ml/
+│   ├── cnn_encoder.py          ← 1D-CNN: [30×5] → vector(128)
+│   ├── svm_classifier.py       ← SVM phân loại 3 lớp (down/neutral/up)
+│   ├── train_pipeline.py       ← Training orchestration
+│   └── model_store/            ← Saved model weights (.pt, .pkl)
+│
+├── rac/
+│   ├── retriever.py            ← Gọi pgvector KNN search
+│   ├── context_enricher.py     ← Gọi Stored Proc compute_rac_context()
+│   ├── rac_classifier.py       ← RAC pipeline: retrieve → enrich → classify
+│   └── explainer.py            ← Format bằng chứng lịch sử cho output
+│
+├── benchmark/
+│   ├── hnsw_vs_seqscan.py      ← So sánh HNSW vs Sequential Scan
+│   ├── hybrid_search_bench.py  ← Benchmark Hybrid Search (B-Tree + HNSW)
+│   ├── indb_vs_appside.py      ← So sánh In-DB Computing vs App-side
+│   ├── chunk_size_bench.py     ← Benchmark chunk interval sizing
+│   └── results/                ← CSV/JSON benchmark outputs
+│
+├── notebooks/
+│   ├── 01_data_exploration.ipynb
+│   ├── 02_embedding_visualization.ipynb  ← t-SNE/UMAP plot of embeddings
+│   ├── 03_hnsw_tuning.ipynb
+│   └── 04_rac_demo.ipynb                ← Demo end-to-end RAC pipeline
+│
+├── report/
+│   ├── CuoiKy_CSDLNC_Hybrid-RAC-Stock.docx
+│   ├── figures/
+│   └── references.bib
+│
+└── tests/
+    ├── test_etl.py
+    ├── test_db_schema.py
+    ├── test_hnsw_recall.py     ← Verify recall@K at different ef_search
+    └── test_rac_pipeline.py
+```
+
+---
+
+## 5. THAM SỐ QUAN TRỌNG CẦN TUNING
+
+### 5.1 TimescaleDB
+
+| Tham số | Mô tả | Giá trị khởi đầu | Ghi chú |
+|---|---|---|---|
+| `chunk_time_interval` | Kích thước chunk theo thời gian | `1 month` | VN100 ~100 mã × ~22 phiên/tháng ≈ 2,200 rows/chunk. Khuyến nghị TimescaleDB: chunk nên chiếm ~25% RAM khả dụng |
+| `compress_after` | Nén chunk sau N ngày | `90 days` | Giảm storage 90%+ cho dữ liệu lịch sử |
+| `compress_segmentby` | Cột phân đoạn compression | `symbol` | Cho phép decompress theo từng mã khi query |
+
+### 5.2 pgvector HNSW
+
+| Tham số | Mô tả | Giá trị khởi đầu | Phạm vi thử nghiệm |
+|---|---|---|---|
+| `m` | Số liên kết hai chiều tối đa mỗi node | `16` | 8, 16, 32, 64 |
+| `ef_construction` | Kích thước danh sách ứng viên khi xây index | `200` | 64, 128, 200, 400 |
+| `ef_search` | Kích thước danh sách ứng viên khi tìm kiếm | `100` | 40, 100, 200, 400 |
+| `maintenance_work_mem` | RAM cho HNSW index build | `512MB` | Phải đủ chứa toàn bộ graph |
+
+**Trade-off cốt lõi:**
+- `m` tăng → Recall tăng, RAM tăng, build time tăng
+- `ef_construction` tăng → Chất lượng graph tốt hơn, build chậm hơn
+- `ef_search` tăng → Recall tăng, query latency tăng (nhưng sublinear)
+
+### 5.3 PostgreSQL General
+
+```ini
+# postgresql.conf — các tham số liên quan đến workload này
+shared_buffers = '2GB'              # 25% RAM cho shared buffer
+effective_cache_size = '6GB'        # 75% RAM
+work_mem = '256MB'                  # Cho sort/hash operations
+maintenance_work_mem = '512MB'      # Cho HNSW index build
+random_page_cost = 1.1              # Nếu dùng SSD
+max_parallel_workers_per_gather = 4
+```
+
+---
+
+## 6. CÁC KỊCH BẢN THỰC NGHIỆM (BENCHMARK)
+
+### 6.1 Kịch bản 1: HNSW vs Sequential Scan
+
+**Mục tiêu:** Chứng minh HNSW tăng tốc tìm kiếm vector so với quét tuần tự.
+
+```sql
+-- Sequential Scan (tắt index)
+SET enable_indexscan = off;
+EXPLAIN ANALYZE
+SELECT id, embedding <=> $query_vec AS distance
+FROM pattern_embeddings
+ORDER BY embedding <=> $query_vec
+LIMIT 20;
+
+-- HNSW Index Scan (bật index)
+SET enable_indexscan = on;
+SET hnsw.ef_search = 100;
+EXPLAIN ANALYZE
+SELECT id, embedding <=> $query_vec AS distance
+FROM pattern_embeddings
+ORDER BY embedding <=> $query_vec
+LIMIT 20;
+```
+
+**Metrics cần đo:** Query latency (ms), Recall@K (so với exact search), Số pages đọc (buffers hit/read từ EXPLAIN ANALYZE).
+
+### 6.2 Kịch bản 2: Hybrid Search (B-Tree + HNSW)
+
+**Mục tiêu:** So sánh hiệu suất khi kết hợp filter (WHERE symbol = ...) với vector search.
+
+```sql
+-- Chỉ HNSW (không filter)
+SELECT * FROM pattern_embeddings
+ORDER BY embedding <=> $query_vec
+LIMIT 20;
+
+-- Hybrid: B-Tree filter trước, HNSW sau
+SELECT * FROM pattern_embeddings
+WHERE symbol = 'VCB'
+ORDER BY embedding <=> $query_vec
+LIMIT 20;
+```
+
+### 6.3 Kịch bản 3: In-DB Computing vs App-side Computing
+
+**Mục tiêu:** So sánh chi phí mạng khi tính thống kê K-láng giềng.
+
+**Phương án A (App-side):** Query trả về K raw vectors → Python tính thống kê.
+**Phương án B (In-DB):** Gọi `compute_rac_context()` → DB trả về kết quả tổng hợp.
+
+**Metrics:** Tổng thời gian end-to-end, dữ liệu truyền qua mạng (bytes), số round-trips.
+
+### 6.4 Kịch bản 4: HNSW Parameter Sweep
+
+**Mục tiêu:** Tìm bộ tham số tối ưu cho dataset cụ thể.
+
+```
+Tham số cần sweep:
+  m:                [8, 16, 32, 64]
+  ef_construction:  [64, 128, 200, 400]
+  ef_search:        [40, 100, 200, 400]
+
+Metrics mỗi tổ hợp:
+  • Index build time (s)
+  • Index size on disk (MB)
+  • Query latency P50/P95/P99 (ms)
+  • Recall@10, Recall@20 vs exact search
+  • RAM usage (pg_stat_activity + OS level)
+```
+
+---
+
+## 7. DỮ LIỆU THỰC NGHIỆM
+
+### 7.1 Nguồn dữ liệu
+
+- **Thư viện:** Vnstock (Python), source: VCI (Vietcap Securities)
+- **Phạm vi:** Rổ VN100 (~100 mã vốn hóa lớn nhất)
+- **Tần suất:** Daily OHLCV (End-of-Day)
+- **Khoảng thời gian:** 2010 – nay (~15 năm), bao phủ đầy đủ các chu kỳ thị trường: sideway (2010–2012, 2018–2019), uptrend (2013–2017, 2020–2021, 2024–), downtrend (2022). Độ dài chuỗi quan trắc này đảm bảo mô hình tiếp xúc với đa dạng regime, giảm thiểu bias do chỉ train trên một pha thị trường duy nhất.
+- **Phân chia:** 80% train (giai đoạn đầu) / 20% test (giai đoạn cuối) — phân chia theo thời gian, KHÔNG random
+
+### 7.2 Quy mô ước tính
+
+```
+100 mã × 15 năm × ~250 phiên/năm = ~375,000 bản ghi OHLCV
+(Lưu ý: không phải tất cả 100 mã đều có dữ liệu từ 2010 — các mã IPO sau
+sẽ có chuỗi ngắn hơn. Ước tính thực tế: ~300,000–350,000 bản ghi OHLCV)
+
+Sliding window stride 1: ~350,000 - 30 = ~349,970 embeddings
+Mỗi embedding: 128 × 4 bytes (float32) = 512 bytes
+Tổng vector data: ~349,970 × 512 bytes ≈ 171 MB (raw, chưa tính HNSW overhead)
+HNSW index overhead: ~2-4x raw data (m=16) → ~340-680 MB
+```
+
+Ở quy mô ~350K vectors, HNSW bắt đầu thể hiện rõ ưu thế so với Sequential Scan (latency chênh lệch 10-50x), TimescaleDB chunking có ý nghĩa hơn khi số chunk đủ lớn để chunk exclusion giảm đáng kể I/O, và HNSW index bắt đầu tạo áp lực lên `maintenance_work_mem` — tạo điều kiện benchmark trade-off RAM/recall có thực chất.
+
+### 7.3 Thuộc tính dữ liệu
+
+| Cột | Kiểu | Ý nghĩa |
+|---|---|---|
+| `time` | `TIMESTAMPTZ` | Timestamp phiên giao dịch — partition key cho hypertable |
+| `symbol` | `TEXT` | Mã cổ phiếu (VCB, FPT, VNM...) — segment key cho compression |
+| `open` | `DOUBLE PRECISION` | Giá mở cửa |
+| `high` | `DOUBLE PRECISION` | Giá cao nhất phiên |
+| `low` | `DOUBLE PRECISION` | Giá thấp nhất phiên |
+| `close` | `DOUBLE PRECISION` | Giá đóng cửa — cơ sở tính return |
+| `volume` | `BIGINT` | Khối lượng khớp lệnh |
+
+---
+
+## 8. ML PIPELINE (TÓM TẮT — CHỈ PHỤC VỤ CONTEXT CHO DB)
+
+> **Lưu ý:** Đề tài tập trung vào database engineering. Phần ML chỉ mô tả đủ để hiểu data flow.
+
+### 8.1 CNN Encoder
+
+- **Kiến trúc:** 1D-CNN
+- **Input:** Tensor [batch_size × 30 × 5] (30 phiên × 5 kênh OHLCV)
+- **Output:** vector(128) — embedding lưu vào pgvector
+- **Vai trò DB:** Embedding được INSERT vào `pattern_embeddings` và indexed bằng HNSW
+
+### 8.2 SVM Classifier
+
+- **Input:** Feature vector = [original_embedding(128)] + [context_features_from_KNN(N)] + [Metadata: dist_to_support, dist_to_resistance]
+- **Context features** từ Stored Procedure: avg_distance, label_distribution, avg_return, stddev_return...
+- **Output:** Label dự báo (0/1/2) + confidence score
+- **Vai trò DB:** Context features được tính IN-DB, giảm round-trip
+
+### 8.3 Nhãn dự báo
+
+| Label | Ý nghĩa | Cách tính |
+|---|---|---|
+| 0 | Giảm (Down) | Return T+5 < -threshold |
+| 1 | Trung tính (Neutral) | -threshold ≤ Return T+5 ≤ +threshold |
+| 2 | Tăng (Up) | Return T+5 > +threshold |
+
+---
+
+## 9. PHƯƠNG PHÁP RAC (RETRIEVAL-AUGMENTED CLASSIFICATION)
+
+### 9.1 Tổng quan
+
+RAC lấy cảm hứng từ khung RAG (Lewis et al., 2020) nhưng áp dụng cho bài toán **phân loại** thay vì sinh văn bản. Pipeline:
+
+```
+Query Embedding → [pgvector KNN] → K Similar Patterns
+                                         │
+                                         ▼
+                              [Stored Proc: Thống kê]
+                                         │
+                                         ▼
+                              Context-Enriched Feature
+                                         │
+                                         ▼
+                              [SVM Classification]
+                                         │
+                                         ▼
+                        Prediction + Historical Evidence
+```
+
+### 9.2 Giá trị của RAC từ góc nhìn DB
+
+**Tính minh bạch:** Mỗi dự báo kèm theo Top-K mẫu hình lịch sử tương đồng nhất — người dùng có thể tự kiểm chứng bằng cách xem lại đồ thị giá của các mẫu này.
+
+**In-DB Computing:** Thống kê K-láng giềng (phân bố label, trung bình return, độ lệch chuẩn) được tính bằng Stored Procedure ngay trên DB, chỉ trả về kết quả tổng hợp thay vì raw vectors → giảm network I/O đáng kể.
+
+**Hybrid Query trong một execution plan:** Stored procedure `compute_full_rac_context()` là minh chứng cốt lõi cho kiến trúc "lai" — trong cùng một lần gọi, PostgreSQL thực hiện đồng thời HNSW Index Scan (trên pgvector) để tìm mẫu hình tương đồng và B-Tree Index Scan (trên bảng S/R Zones) để tính khoảng cách đến vùng hỗ trợ/kháng cự. App-layer chỉ cần một round-trip duy nhất để nhận về toàn bộ context: thống kê KNN, metadata S/R, tỷ lệ vị trí giá (`sr_position_ratio`), và danh sách neighbor IDs.
+
+**Làm giàu ngữ cảnh (Context Enrichment):** Sự kết hợp giữa tìm kiếm phi cấu trúc (Embedding HNSW) và tính toán khoảng cách siêu dữ liệu có cấu trúc (Metadata S/R Zones) ngay tại tầng CSDL cung cấp cho mô hình SVM góc nhìn toàn diện: "Mẫu hình này trong quá khứ diễn biến ra sao?" VÀ "Mẫu hình hiện tại đang đứng ở đâu so với các mốc cản tâm lý?".
+
+---
+
+## 10. CÁC VẤN ĐỀ KỸ THUẬT CẦN GIẢI QUYẾT (TỪ BÁO CÁO GIỮA KỲ)
+
+### 10.1 Chi phí Re-indexing HNSW
+
+Khi có dữ liệu mới (daily ingestion), HNSW index cần cập nhật. pgvector hỗ trợ incremental insert (không cần rebuild toàn bộ), nhưng hiệu suất có thể giảm dần khi graph phình to. Chiến lược:
+- `REINDEX CONCURRENTLY` khi recall giảm dưới ngưỡng
+- Partitioned approach: separate HNSW index theo khoảng thời gian
+- Monitor recall định kỳ so với exact search
+
+### 10.2 Market Regime Shift
+
+Khi thị trường chuyển trạng thái (bull → bear → sideways), distribution của embeddings thay đổi. Embedding từ giai đoạn bull market có thể không tương đồng với patterns trong bear market. Chiến lược:
+- Time-decay weighting: ưu tiên láng giềng gần hơn về thời gian
+- Sliding retraining window cho CNN encoder
+- Monitor avg_cosine_distance — nếu tăng đột biến → regime shift detected
+
+### 10.3 Bottleneck bộ nhớ
+
+HNSW index cần nằm hoàn toàn trong RAM để đạt hiệu suất tối ưu. Với `m=16` và ~350K vectors 128-chiều, index size ước tính 340–680 MB — vẫn khả thi trên máy 8GB RAM nhưng đã bắt đầu tạo áp lực lên shared_buffers. Khi scale lên 1M+ vectors:
+- Giảm `m` (trade-off recall)
+- Dùng `halfvec(128)` (half-precision float16) → giảm 50% memory
+- Partitioning: tách index theo thời gian hoặc sector
+
+---
+
+## 11. TÀI LIỆU THAM KHẢO CHÍNH
+
+### Papers
+
+1. **Malkov, Y. A. & Yashunin, D. A. (2018).** "Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs." *IEEE TPAMI*, 42(4), 824–836.
+2. **Lewis, P. et al. (2020).** "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." *NeurIPS 2020*, 9459–9474.
+3. **Yeo, W. J. et al. (2023).** "A Comprehensive Review on Financial Explainable AI." *arXiv:2309.11960*.
+
+### Technical Documentation
+
+4. **PostgreSQL Global Development Group.** PostgreSQL 16 Documentation — B-Tree Indexes, Index Types. *postgresql.org/docs/16/*
+5. **Timescale, Inc.** TimescaleDB Documentation — Hypertables, Compression, Continuous Aggregates. *docs.timescale.com*
+6. **pgvector contributors.** pgvector — Open-source vector similarity search for Postgres. *github.com/pgvector/pgvector*
+
+---
+
+## 12. QUY ƯỚC CODING
+
+### 12.1 Database
+
+- Tên bảng: `snake_case`, số ít (`stock_ohlcv`, không phải `stocks_ohlcvs`)
+- Tên cột: `snake_case`
+- Stored Procedures: `snake_case`, prefix mô tả hành động (`find_`, `compute_`, `get_`)
+- Migration files: đánh số tuần tự `001_`, `002_`...
+- Mọi query phải có `EXPLAIN ANALYZE` trong giai đoạn benchmark
+
+### 12.2 Python
+
+- Python 3.10+
+- DB connection: `psycopg2` hoặc `asyncpg`
+- ORM: KHÔNG dùng ORM cho benchmark (raw SQL để control query plan)
+- ML framework: PyTorch (CNN), scikit-learn (SVM)
+- Data: pandas cho preprocessing, numpy cho vector operations
+- Config: `.env` + python-dotenv
+
+### 12.3 Git
+
+- Branch: `main` (stable), `dev` (working), `feature/*`, `benchmark/*`
+- Commit message: `[module] action: description` (ví dụ: `[db] add: HNSW parameter sweep benchmark`)
+- Không commit model weights > 100MB → dùng `.gitignore`
+
+---
+
+## 13. NGUYÊN TẮC QUAN TRỌNG KHI IMPLEMENT
+
+> **Nguyên tắc #1:** Mọi quyết định thiết kế phải xuất phát từ góc nhìn **database engineering**. Khi viết code hoặc báo cáo, luôn hỏi: "Database đang giải quyết gì ở đây? I/O pattern ra sao? Index nào đang được sử dụng? Query plan trông như thế nào?"
+
+> **Nguyên tắc #2:** KHÔNG sa đà vào giải thích AI/Deep Learning. CNN chỉ là công cụ tạo embedding — điều quan trọng là embedding đó được **lưu trữ, đánh index, và truy vấn** như thế nào trong PostgreSQL.
+
+> **Nguyên tắc #3:** Mọi claim về hiệu suất phải có `EXPLAIN ANALYZE` kèm theo. Không nói "nhanh hơn" mà không có con số cụ thể (latency ms, pages read, buffer hit ratio).
+
+> **Nguyên tắc #4:** Benchmark phải fair — cùng hardware, cùng dataset, warm cache vs cold cache phải ghi rõ. Dùng `pg_stat_statements` để monitor.
