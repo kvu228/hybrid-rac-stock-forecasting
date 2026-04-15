@@ -68,6 +68,68 @@ Trong `psql`:
 - `\dt` (có các bảng schema Phase 1)
 - `SELECT indexname FROM pg_indexes WHERE tablename='pattern_embeddings' ORDER BY indexname;` (có `idx_embedding_hnsw`)
 
+## Chạy Phase 2 (ETL: fetch → clean → ingest)
+
+### Seed dataset nhỏ (khuyến nghị cho CI/dev)
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+# đảm bảo schema mới nhất (bao gồm unique key cho ingest idempotent)
+alembic upgrade head
+
+python -m db.seed_small_dataset
+```
+
+### Chạy ETL pipeline (gọi Vnstock)
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+# Backfill theo khoảng thời gian
+python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2
+
+# Incremental (tự lấy từ MAX(time) trong DB theo từng mã → end)
+python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2
+```
+
+### Fetch full VN100 (lần đầu: 2010 → nay)
+
+Repo có sẵn danh sách VN100 ở `etl/tickers_vn100.txt`.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+alembic upgrade head
+
+# Backfill toàn bộ VN100 (chia theo năm để tránh timeout)
+python -m etl.pipeline backfill --symbols-file etl/tickers_vn100.txt --start 2010-01-01 --end 2026-04-15 --chunk-days 365 --concurrency 4
+```
+
+Các lần sau chỉ cần incremental:
+
+```powershell
+python -m etl.pipeline incremental --symbols-file etl/tickers_vn100.txt --end 2026-04-15 --chunk-days 365 --concurrency 4
+```
+
+### Tests / Lint / Type-check
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+ruff check .
+mypy .
+pytest -q
+```
+
 ---
 
 ## English
@@ -128,5 +190,64 @@ alembic upgrade head
 
 ```powershell
 docker exec -it hybrid_rac_db psql -U postgres -d hybrid_rac
+```
+
+## Run Phase 2 (ETL: fetch → clean → ingest)
+
+### Seed a small dataset (recommended for CI/dev)
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+alembic upgrade head
+python -m db.seed_small_dataset
+```
+
+### Run ETL pipeline (calls Vnstock)
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+# Backfill a date range
+python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2
+
+# Incremental (from MAX(time) in DB per symbol → end)
+python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2
+```
+
+### Fetch full VN100 (first run: 2010 → present)
+
+The repo includes a VN100 ticker list at `etl/tickers_vn100.txt`.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+alembic upgrade head
+
+python -m etl.pipeline backfill --symbols-file etl/tickers_vn100.txt --start 2010-01-01 --end 2026-04-15 --chunk-days 365 --concurrency 4
+```
+
+After that, use incremental mode:
+
+```powershell
+python -m etl.pipeline incremental --symbols-file etl/tickers_vn100.txt --end 2026-04-15 --chunk-days 365 --concurrency 4
+```
+
+### Tests / Lint / Type-check
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+$env:DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac"
+
+ruff check .
+mypy .
+pytest -q
 ```
 
