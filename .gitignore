@@ -1,0 +1,60 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Alembic / Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Logs & runtime files
+*.log
+*.pid
+
+# Data / artifacts (keep real data out of git)
+data/
+datasets/
+artifacts/
+outputs/
+models/
+reports/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Cursor
+.cursor/
+
+# Secrets / keys
+*.pem
+*.key
+*.p12
+*.pfx
