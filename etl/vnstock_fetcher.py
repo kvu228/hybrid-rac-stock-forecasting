@@ -10,6 +10,48 @@ import pandas as pd
 Provider = Literal["vci"]
 
 
+def _is_no_data_error(err: BaseException) -> bool:
+    """
+    vnstock may raise ValueError("Không tìm thấy dữ liệu...") for invalid symbol/date range.
+    Sometimes this is wrapped by tenacity.RetryError; we treat the whole chain as "no data".
+    """
+
+    def _has_no_data_text(msg: str) -> bool:
+        return (
+            "Không tìm thấy dữ liệu" in msg
+            or "Khong tim thay du lieu" in msg
+            or "No data" in msg
+        )
+
+    # 1) Direct message checks.
+    if _has_no_data_text(str(err)):
+        return True
+
+    # 2) Unwrap tenacity RetryError if present.
+    try:
+        import tenacity
+
+        if isinstance(err, tenacity.RetryError):
+            last = getattr(err, "last_attempt", None)
+            if last is not None:
+                last_exc = getattr(last, "exception", lambda: None)()
+                if last_exc is not None and _has_no_data_text(str(last_exc)):
+                    return True
+    except Exception:
+        pass
+
+    # 3) Walk cause/context chain.
+    seen: set[int] = set()
+    cur: BaseException | None = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if _has_no_data_text(str(cur)):
+            return True
+        cur = cur.__cause__ or cur.__context__
+
+    return False
+
+
 @dataclass(frozen=True)
 class FetchRequest:
     symbol: str
@@ -33,7 +75,14 @@ def fetch_ohlcv(req: FetchRequest) -> pd.DataFrame:
     from vnstock import Quote
 
     q = Quote(source="vci", symbol=req.symbol)
-    df = q.history(start=req.start.isoformat(), end=req.end.isoformat(), interval="1D")
+    try:
+        df = q.history(start=req.start.isoformat(), end=req.end.isoformat(), interval="1D")
+    except Exception as e:
+        # vnstock may raise (and wrap with tenacity RetryError) when there is no data for
+        # the symbol or date range. Treat it as an empty result so ETL can proceed.
+        if _is_no_data_error(e):
+            return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
+        raise
     if df.empty:
         return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
 

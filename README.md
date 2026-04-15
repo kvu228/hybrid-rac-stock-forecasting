@@ -37,6 +37,7 @@ Hiện repo chủ yếu chứa **tài liệu thiết kế** (xem `PROJECT_CONTEX
 ### 1) Cấu hình biến môi trường
 
 - Copy `.env.example` → `.env` và chỉnh nếu cần.
+- ETL sẽ **tự load** `.env` (nếu có) để lấy `DATABASE_URL` và `VNSTOCK_API_KEY`.
 
 ### 2) Khởi động PostgreSQL (TimescaleDB + pgvector)
 

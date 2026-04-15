@@ -18,6 +18,50 @@ from etl.vnstock_fetcher import fetch_ohlcv
 def _parse_date(s: str) -> date:
     return date.fromisoformat(s)
 
+
+def _register_vnstock_user_from_env() -> None:
+    api_key = (os.getenv("VNSTOCK_API_KEY") or "").strip()
+    debug = (os.getenv("VNSTOCK_DEBUG_AUTH") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if not api_key:
+        if debug:
+            print("vnstock auth: guest (VNSTOCK_API_KEY not set)")
+        return
+
+    try:
+        from vnstock import register_user
+    except Exception:
+        # If vnstock isn't available (or API changed), keep the pipeline runnable.
+        if debug:
+            print("vnstock auth: skipped (could not import vnstock.register_user)")
+        return
+
+    try:
+        ok = bool(register_user(api_key=api_key))
+        if debug:
+            print(f"vnstock auth: register_user returned {ok}")
+    except Exception:
+        # Don't fail ETL just because auth couldn't be performed.
+        if debug:
+            print("vnstock auth: failed (exception during register_user)")
+        return
+
+
+def _load_dotenv_if_present() -> None:
+    """
+    Load `.env` into process environment if available.
+
+    This repo commonly stores `DATABASE_URL` and `VNSTOCK_API_KEY` in `.env`, but Python
+    does not automatically read it unless we do.
+    """
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+
+    # Only load local `.env` (if present) and do not override existing env vars.
+    load_dotenv(override=False)
+
+
 def _load_symbols(symbols: list[str] | None, symbols_file: str | None) -> list[str]:
     if symbols and symbols_file:
         raise SystemExit("Use either --symbols or --symbols-file, not both")
@@ -116,6 +160,8 @@ def _fetch_clean_ingest_one(
 
 
 def main() -> None:
+    _load_dotenv_if_present()
+
     parser = argparse.ArgumentParser(description="ETL CLI: seed | backfill | incremental")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -144,6 +190,9 @@ def main() -> None:
     p_incr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
     args = parser.parse_args()
+
+    # If VNSTOCK_API_KEY is set, register once to raise rate limits.
+    _register_vnstock_user_from_env()
 
     if args.cmd == "seed":
         seed_small_dataset()
