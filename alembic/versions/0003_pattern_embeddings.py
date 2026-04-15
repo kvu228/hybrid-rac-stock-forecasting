@@ -8,7 +8,6 @@ Create Date: 2026-04-15
 from __future__ import annotations
 
 from alembic import op
-import sqlalchemy as sa
 
 revision = "0003_pattern_embeddings"
 down_revision = "0002_stock_ohlcv_hypertable"

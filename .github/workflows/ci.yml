@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --dev
+
+      - name: Ruff (lint)
+        run: uv run ruff check . --output-format=github
+
+      - name: Mypy (type check)
+        run: uv run mypy .
+
+      - name: Build and start database (Docker Compose)
+        run: docker compose --env-file .env.example up -d --build
+
+      - name: Wait for database to be healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cid="$(docker compose ps -q db)"
+          if [ -z "$cid" ]; then
+            echo "DB container id not found"
+            docker compose ps
+            exit 1
+          fi
+
+          echo "Waiting for DB healthcheck to report healthy..."
+          for i in {1..60}; do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)"
+            if [ "$status" = "healthy" ]; then
+              echo "DB is healthy."
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "DB reported unhealthy."
+              docker compose logs db || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Timed out waiting for DB healthcheck."
+          docker compose logs db || true
+          exit 1
+
+      - name: Run migrations (Alembic)
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac
+        run: uv run alembic upgrade head
+
+      - name: Run tests (pytest)
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/hybrid_rac
+        run: uv run pytest -q
+

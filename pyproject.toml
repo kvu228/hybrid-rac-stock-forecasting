@@ -11,3 +11,18 @@ dependencies = [
     "sqlalchemy>=2.0.49",
     "vnstock==3.5.1",
 ]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.1",
+    "pytest>=9.0.3",
+    "ruff>=0.15.10",
+]
+
+[tool.mypy]
+python_version = "3.13"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+no_implicit_optional = true
+ignore_missing_imports = true
