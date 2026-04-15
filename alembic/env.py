@@ -16,7 +16,10 @@ def _get_database_url() -> str:
     url = os.getenv("DATABASE_URL")
     if url:
         return url
-    return config.get_main_option("sqlalchemy.url")
+    ini_url = config.get_main_option("sqlalchemy.url")
+    if not ini_url:
+        raise RuntimeError("DATABASE_URL or sqlalchemy.url (alembic.ini) must be set")
+    return ini_url
 
 
 target_metadata = None
