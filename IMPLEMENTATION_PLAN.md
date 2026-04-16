@@ -131,33 +131,33 @@
 
 > **Mục tiêu:** HTTP API thay thế CLI, phục vụ làm backend cho Streamlit dashboard.
 
-- [ ] 7.1 **App skeleton** (`api/main.py`)
-    - [ ] FastAPI app + lifespan (async connection pool via `psycopg_pool`)
-    - [ ] CORS middleware
-    - [ ] `api/deps.py` — shared dependency `get_db_conn`
-    - [ ] `api/schemas.py` — Pydantic request/response models
+- [x] 7.1 **App skeleton** (`api/main.py`)
+    - [x] FastAPI app + lifespan (async connection pool via `psycopg_pool`)
+    - [x] CORS middleware
+    - [x] `api/deps.py` — shared dependency `get_db_conn`
+    - [x] `api/schemas.py` — Pydantic request/response models
 - [ ] 7.2 **ETL Router** (`api/routers/etl.py`)
     - [ ] `POST /api/etl/seed` — load fixture
     - [ ] `POST /api/etl/backfill` — background task, trả job_id
     - [ ] `POST /api/etl/incremental` — background task
     - [ ] `GET /api/etl/status/{job_id}` — poll trạng thái
-- [ ] 7.3 **OHLCV Router** (`api/routers/ohlcv.py`)
-    - [ ] `GET /api/symbols` — danh sách symbols trong DB
-    - [ ] `GET /api/ohlcv/{symbol}?start=...&end=...` — OHLCV theo time range
-    - [ ] `GET /api/ohlcv/{symbol}/latest?n=30` — N phiên gần nhất
+- [x] 7.3 **OHLCV Router** (`api/routers/ohlcv.py`)
+    - [x] `GET /api/symbols` — danh sách symbols trong DB
+    - [x] `GET /api/ohlcv/{symbol}?start=...&end=...` — OHLCV theo time range
+    - [x] `GET /api/ohlcv/{symbol}/latest?n=30` — N phiên gần nhất
 - [ ] 7.4 **RAC Router** (`api/routers/rac.py`)
     - [ ] `POST /api/rac/similar-patterns` — gọi `find_similar_patterns()`
     - [ ] `POST /api/rac/context` — gọi `compute_rac_context()`
     - [ ] `POST /api/rac/full-context` — gọi `compute_full_rac_context()` (★ Hybrid Query)
     - [ ] `GET /api/rac/predictions/{symbol}?limit=20` — lịch sử predictions
-- [ ] 7.5 **Metadata Router** (`api/routers/metadata.py`)
-    - [ ] `GET /api/sr-zones/{symbol}` — S/R zones active
-    - [ ] `GET /api/sr-zones/{symbol}/distance?price=...` — gọi `get_distance_to_nearest_sr()`
+- [x] 7.5 **Metadata Router** (`api/routers/metadata.py`)
+    - [x] `GET /api/sr-zones/{symbol}` — S/R zones active
+    - [x] `GET /api/sr-zones/{symbol}/distance?price=...` — gọi `get_distance_to_nearest_sr()`
 - [ ] 7.6 **Benchmark Router** (`api/routers/benchmark.py`)
     - [ ] `POST /api/benchmark/explain` — chạy `EXPLAIN ANALYZE`
     - [ ] `GET /api/benchmark/stats` — `pg_stat_statements` summary
-- [ ] 7.7 **Dependencies**: `uv add uvicorn psycopg-pool`
-- [ ] 7.8 **Tests**: API integration tests với `httpx.AsyncClient`
+- [x] 7.7 **Dependencies**: `uv add uvicorn psycopg-pool`
+- [x] 7.8 **Tests**: API integration tests với `httpx.AsyncClient`
 
 ---
 
@@ -208,4 +208,4 @@ Phase 8 (Streamlit)  ←──  Phase 6 (Benchmark)
 - Phase 3 → 4 → 5 là đường critical path (phải có embeddings trước khi chạy RAC)
 - Phase 7 (API) có thể bắt đầu song song với Phase 4 cho phần OHLCV + ETL routers (không cần embeddings)
 - Phase 6 (Benchmark) cần Phase 5 hoàn thành để có dữ liệu embeddings đầy đủ
-- Phase 8 (Streamlit) bắt đầu sau khi API có ít nhất OHLCV + RAC endpoints
+- Phase 8 (Streamlit) bắt đầu sau khi API có ít nhất OHLCV + RAC endpointst

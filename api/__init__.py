@@ -1,0 +1,1 @@
+"""FastAPI application for Hybrid-RAC-Stock-Forecasting."""
