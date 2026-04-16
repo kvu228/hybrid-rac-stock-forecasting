@@ -13,6 +13,7 @@ from db.seed_small_dataset import main as seed_small_dataset
 from etl.data_cleaner import clean_ohlcv
 from etl.ingestion import ingest_stock_ohlcv
 from etl.vnstock_fetcher import fetch_ohlcv
+from dotenv import load_dotenv
 
 
 def _parse_date(s: str) -> date:
@@ -53,10 +54,6 @@ def _load_dotenv_if_present() -> None:
     This repo commonly stores `DATABASE_URL` and `VNSTOCK_API_KEY` in `.env`, but Python
     does not automatically read it unless we do.
     """
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        return
 
     # Only load local `.env` (if present) and do not override existing env vars.
     load_dotenv(override=False)
@@ -159,6 +156,112 @@ def _fetch_clean_ingest_one(
     return (symbol, fetched, cleaned_rows, dropped_dupes, inserted_or_updated)
 
 
+def _fetch_ohlcv_from_db(
+    database_url: str,
+    symbols: list[str],
+    start: date | None,
+    end: date | None,
+) -> pd.DataFrame:
+    """Read OHLCV rows from the DB for the given symbols and optional date range."""
+    engine = _engine(database_url)
+    clauses = ["symbol = ANY(:symbols)"]
+    params: dict[str, object] = {"symbols": symbols}
+    if start is not None:
+        clauses.append("time >= :start")
+        params["start"] = str(start)
+    if end is not None:
+        clauses.append("time <= :end")
+        params["end"] = str(end)
+
+    where = " AND ".join(clauses)
+    query = sa.text(
+        f"SELECT time, symbol, open, high, low, close, volume FROM stock_ohlcv WHERE {where} ORDER BY symbol, time"  # noqa: S608
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
+    return pd.DataFrame(rows, columns=["time", "symbol", "open", "high", "low", "close", "volume"])
+
+
+def _cmd_generate_windows(args: argparse.Namespace, database_url: str) -> None:
+    from etl.feature_engineer import (
+        forward_fill_trading_days,
+        generate_windows,
+        train_test_split_by_time,
+    )
+
+    import numpy as np
+
+    symbols = _load_symbols(args.symbols, args.symbols_file)
+    df = _fetch_ohlcv_from_db(database_url, symbols, args.start, args.end)
+    if df.empty:
+        print("No OHLCV data found for the given symbols/date range.")
+        return
+
+    df = forward_fill_trading_days(df)
+    records = generate_windows(
+        df,
+        window_size=args.window_size,
+        horizon=args.horizon,
+        stride=args.stride,
+        up_threshold=args.up_threshold,
+        down_threshold=args.down_threshold,
+    )
+    if not records:
+        print("Not enough data to generate windows.")
+        return
+
+    train, test = train_test_split_by_time(records, train_ratio=args.train_ratio)
+
+    # Export to disk
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for split_name, split_recs in [("train", train), ("test", test)]:
+        if not split_recs:
+            continue
+        data = np.stack([r.data for r in split_recs])  # (N, window_size, 5)
+        meta = pd.DataFrame(
+            {
+                "symbol": [r.symbol for r in split_recs],
+                "window_start": [r.window_start for r in split_recs],
+                "window_end": [r.window_end for r in split_recs],
+                "label": [r.label for r in split_recs],
+                "future_return": [r.future_return for r in split_recs],
+            }
+        )
+        np.savez_compressed(out_dir / f"{split_name}_windows.npz", data=data)
+        meta.to_csv(out_dir / f"{split_name}_metadata.csv", index=False)
+
+    label_counts = {0: 0, 1: 0, 2: 0}
+    for r in records:
+        label_counts[r.label] += 1
+
+    print(
+        f"windows={len(records)} train={len(train)} test={len(test)} "
+        f"labels={{Down={label_counts[0]}, Neutral={label_counts[1]}, Up={label_counts[2]}}}"
+    )
+    print(f"Saved to {out_dir}/")
+
+
+def _cmd_detect_sr(args: argparse.Namespace, database_url: str) -> None:
+    from etl.sr_detector import detect_sr_zones, ingest_sr_zones
+
+    symbols = _load_symbols(args.symbols, args.symbols_file)
+    df = _fetch_ohlcv_from_db(database_url, symbols, start=None, end=None)
+    if df.empty:
+        print("No OHLCV data found for the given symbols.")
+        return
+
+    zones = detect_sr_zones(df, order=args.order)
+    inserted = ingest_sr_zones(zones, database_url)
+    support_count = sum(1 for z in zones if z.zone_type == "SUPPORT")
+    resist_count = sum(1 for z in zones if z.zone_type == "RESISTANCE")
+    print(f"symbols={len(symbols)} zones={len(zones)} support={support_count} resistance={resist_count} inserted={inserted}")
+
+
 def main() -> None:
     _load_dotenv_if_present()
 
@@ -189,6 +292,28 @@ def main() -> None:
     p_incr.add_argument("--concurrency", type=int, default=1, help="Number of symbols to fetch in parallel (default: 1)")
     p_incr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
+    # --- Phase 3: Feature Engineering commands ---
+
+    p_windows = sub.add_parser("generate-windows", help="Generate labeled sliding windows from OHLCV data in DB")
+    p_windows.add_argument("--symbols", nargs="+", help="Ticker symbols")
+    p_windows.add_argument("--symbols-file", help="Text file with one symbol per line")
+    p_windows.add_argument("--start", type=_parse_date, default=None, help="Start date filter (optional)")
+    p_windows.add_argument("--end", type=_parse_date, default=None, help="End date filter (optional)")
+    p_windows.add_argument("--window-size", type=int, default=30, help="Sessions per window (default: 30)")
+    p_windows.add_argument("--horizon", type=int, default=5, help="Forward return horizon in sessions (default: 5)")
+    p_windows.add_argument("--stride", type=int, default=1, help="Window stride (default: 1)")
+    p_windows.add_argument("--up-threshold", type=float, default=0.02, help="Return >= this → Up label (default: 0.02)")
+    p_windows.add_argument("--down-threshold", type=float, default=-0.02, help="Return <= this → Down label (default: -0.02)")
+    p_windows.add_argument("--train-ratio", type=float, default=0.8, help="Chronological train ratio (default: 0.8)")
+    p_windows.add_argument("--output-dir", default="data/windows", help="Directory for output .npz + metadata (default: data/windows)")
+    p_windows.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
+
+    p_sr = sub.add_parser("detect-sr", help="Detect support/resistance zones and insert into DB")
+    p_sr.add_argument("--symbols", nargs="+", help="Ticker symbols")
+    p_sr.add_argument("--symbols-file", help="Text file with one symbol per line")
+    p_sr.add_argument("--order", type=int, default=5, help="Pivot half-window size (default: 5)")
+    p_sr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
+
     args = parser.parse_args()
 
     # If VNSTOCK_API_KEY is set, register once to raise rate limits.
@@ -201,6 +326,14 @@ def main() -> None:
     database_url = args.database_url
     if not database_url:
         raise SystemExit("DATABASE_URL is required (or pass --database-url)")
+
+    if args.cmd == "generate-windows":
+        _cmd_generate_windows(args, database_url)
+        return
+
+    if args.cmd == "detect-sr":
+        _cmd_detect_sr(args, database_url)
+        return
 
     if args.cmd == "backfill":
         symbols = _load_symbols(args.symbols, args.symbols_file)

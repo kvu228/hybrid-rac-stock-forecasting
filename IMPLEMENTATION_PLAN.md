@@ -35,21 +35,21 @@
 
 > **Mục tiêu:** Chuẩn bị dữ liệu đầu vào cho CNN Encoder — từ raw OHLCV tạo sliding windows + labels.
 
-- [ ] 3.1 **Preprocessing module** (`etl/feature_engineer.py`)
-    - [ ] Z-score normalization per window (chuẩn hóa mỗi cửa sổ độc lập)
-    - [ ] Relative return transformation (close-to-close %)
-    - [ ] Forward-fill giá cho missing sessions (align trading calendar)
-- [ ] 3.2 **Sliding Window Generator**
-    - [ ] Tạo windows [30 sessions × 5 channels (OHLCV)] với stride=1
-    - [ ] Gắn label cho mỗi window: T+5 return → {0: Down, 1: Neutral, 2: Up} theo threshold
-    - [ ] Lưu metadata: symbol, window_start, window_end, label, future_return
-- [ ] 3.3 **S/R Zone Detection** (`etl/sr_detector.py`)
-    - [ ] Thuật toán phát hiện Pivot Points / đảo chiều trên chuỗi giá
-    - [ ] Tính strength (số lần giá test vùng)
-    - [ ] INSERT vào bảng `support_resistance_zones`
-- [ ] 3.4 **Train/Test Split**
-    - [ ] Phân chia theo thời gian (80% đầu / 20% cuối), KHÔNG random
-    - [ ] Export metadata split để các phase sau dùng chung
+- [x] 3.1 **Preprocessing module** (`etl/feature_engineer.py`)
+    - [x] Z-score normalization per window (chuẩn hóa mỗi cửa sổ độc lập)
+    - [x] Relative return transformation (close-to-close %)
+    - [x] Forward-fill giá cho missing sessions (align trading calendar)
+- [x] 3.2 **Sliding Window Generator**
+    - [x] Tạo windows [30 sessions × 5 channels (OHLCV)] với stride=1
+    - [x] Gắn label cho mỗi window: T+5 return → {0: Down, 1: Neutral, 2: Up} theo threshold
+    - [x] Lưu metadata: symbol, window_start, window_end, label, future_return
+- [x] 3.3 **S/R Zone Detection** (`etl/sr_detector.py`)
+    - [x] Thuật toán phát hiện Pivot Points / đảo chiều trên chuỗi giá
+    - [x] Tính strength (số lần giá test vùng)
+    - [x] INSERT vào bảng `support_resistance_zones`
+- [x] 3.4 **Train/Test Split**
+    - [x] Phân chia theo thời gian (80% đầu / 20% cuối), KHÔNG random
+    - [x] Export metadata split để các phase sau dùng chung
 
 ---
 
