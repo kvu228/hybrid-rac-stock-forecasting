@@ -493,6 +493,28 @@ hybrid-rac-stock/
 │   ├── rac_classifier.py       ← RAC pipeline: retrieve → enrich → classify
 │   └── explainer.py            ← Format bằng chứng lịch sử cho output
 │
+├── api/                         ← FastAPI REST API (Demo layer)
+│   ├── __init__.py
+│   ├── main.py              ← App factory, lifespan (DB pool startup/shutdown)
+│   ├── deps.py              ← Shared dependencies (get_db_conn)
+│   ├── routers/
+│   │   ├── etl.py           ← POST /api/etl/* (trigger ETL qua background task)
+│   │   ├── ohlcv.py         ← GET /api/symbols, /api/ohlcv/{symbol}
+│   │   ├── rac.py           ← POST /api/rac/* (gọi stored procedures)
+│   │   └── metadata.py      ← GET /api/sr-zones/{symbol}
+│   └── schemas.py           ← Pydantic request/response models
+│
+├── streamlit_app/               ← Streamlit Dashboard (Visualization)
+│   ├── app.py               ← Entry point (multi-page)
+│   ├── pages/
+│   │   ├── 1_ohlcv_chart.py     ← Candlestick + S/R overlay
+│   │   ├── 2_similar_patterns.py ← So sánh K-neighbor patterns
+│   │   ├── 3_rac_prediction.py   ← Full RAC context + prediction
+│   │   └── 4_benchmark.py        ← HNSW vs SeqScan, query plan viewer
+│   └── components/
+│       ├── candlestick.py   ← Plotly candlestick helper
+│       └── similarity.py    ← Normalized overlay chart helper
+│
 ├── benchmark/
 │   ├── hnsw_vs_seqscan.py      ← So sánh HNSW vs Sequential Scan
 │   ├── hybrid_search_bench.py  ← Benchmark Hybrid Search (B-Tree + HNSW)
@@ -844,4 +866,300 @@ HNSW index cần nằm hoàn toàn trong RAM để đạt hiệu suất tối ư
 > **Nguyên tắc #3:** Mọi claim về hiệu suất phải có `EXPLAIN ANALYZE` kèm theo. Không nói "nhanh hơn" mà không có con số cụ thể (latency ms, pages read, buffer hit ratio).
 
 > **Nguyên tắc #4:** Benchmark phải fair — cùng hardware, cùng dataset, warm cache vs cold cache phải ghi rõ. Dùng `pg_stat_statements` để monitor.
+
+---
+
+## 14. DEMO LAYER — FastAPI REST API
+
+### 14.1 Mục đích
+
+Cung cấp HTTP API để trigger ETL, truy vấn dữ liệu OHLCV, và gọi các Stored Procedures (RAC pipeline) — thay thế việc chạy CLI thủ công. API đóng vai trò **backend cho Streamlit dashboard** và cũng phục vụ demo khi bảo vệ đề tài.
+
+### 14.2 Kiến trúc tổng quan
+
+```
+Streamlit (UI) ──HTTP──→ FastAPI ──psycopg──→ PostgreSQL
+                              │
+                              ├── ETL Router      → trigger backfill/incremental
+                              ├── OHLCV Router    → đọc dữ liệu chuỗi thời gian
+                              ├── RAC Router      → gọi stored procedures
+                              └── Metadata Router → S/R zones
+```
+
+**Nguyên tắc:** Streamlit KHÔNG kết nối DB trực tiếp — mọi truy vấn đi qua FastAPI để giữ đúng kiến trúc layered.
+
+### 14.3 Danh sách Endpoints
+
+#### Nhóm ETL — Trigger pipeline qua API
+
+| Method | Endpoint | Mô tả | Ghi chú |
+|--------|----------|--------|---------|
+| `POST` | `/api/etl/seed` | Load fixture dataset nhỏ | Đồng bộ (nhanh) |
+| `POST` | `/api/etl/backfill` | Backfill OHLCV theo symbols + date range | **Background task** (chạy lâu) |
+| `POST` | `/api/etl/incremental` | Cập nhật dữ liệu mới nhất | **Background task** |
+| `GET` | `/api/etl/status/{job_id}` | Kiểm tra trạng thái job đang chạy | Poll từ Streamlit |
+
+**Request body mẫu (backfill):**
+
+```json
+{
+  "symbols": ["VCB", "FPT", "VNM"],
+  "start": "2024-01-01",
+  "end": "2024-12-31",
+  "chunk_days": 365,
+  "concurrency": 2
+}
+```
+
+**Response mẫu:**
+
+```json
+{
+  "job_id": "a1b2c3d4-...",
+  "status": "started",
+  "message": "Backfill job queued for 3 symbols"
+}
+```
+
+> **Lưu ý:** ETL có thể chạy hàng phút → dùng `BackgroundTasks` của FastAPI, client poll `/api/etl/status/{job_id}` để theo dõi tiến trình.
+
+#### Nhóm Data — Đọc OHLCV
+
+| Method | Endpoint | Mô tả | Query trên DB |
+|--------|----------|--------|---------------|
+| `GET` | `/api/symbols` | Danh sách symbols có trong DB | `SELECT DISTINCT symbol FROM stock_ohlcv` |
+| `GET` | `/api/ohlcv/{symbol}?start=...&end=...` | OHLCV theo symbol + time range | B-Tree index scan trên `(symbol, time)` |
+| `GET` | `/api/ohlcv/{symbol}/latest?n=30` | N phiên gần nhất | Phục vụ sliding window preview |
+
+#### Nhóm RAC — Gọi Stored Procedures (★ Core)
+
+| Method | Endpoint | Stored Procedure | Vai trò DB |
+|--------|----------|------------------|------------|
+| `POST` | `/api/rac/similar-patterns` | `find_similar_patterns()` | HNSW Index Scan |
+| `POST` | `/api/rac/context` | `compute_rac_context()` | HNSW + In-DB aggregation |
+| `POST` | `/api/rac/full-context` | `compute_full_rac_context()` | **Hybrid Query**: HNSW + B-Tree trong 1 execution plan |
+| `GET` | `/api/rac/predictions/{symbol}?limit=20` | `SELECT FROM rac_predictions` | Lịch sử predictions đã lưu |
+
+**Request body mẫu (similar-patterns):**
+
+```json
+{
+  "query_embedding": [0.12, -0.34, 0.56, ...],
+  "k": 20,
+  "similarity_threshold": 0.7,
+  "filter_symbol": "VCB"
+}
+```
+
+**Response mẫu:**
+
+```json
+{
+  "neighbors": [
+    {
+      "id": 12345,
+      "symbol": "VCB",
+      "label": 2,
+      "future_return": 0.034,
+      "cosine_distance": 0.08,
+      "window_start": "2021-06-01T00:00:00+07:00",
+      "window_end": "2021-07-14T00:00:00+07:00"
+    }
+  ],
+  "query_time_ms": 2.3
+}
+```
+
+#### Nhóm Metadata — S/R Zones
+
+| Method | Endpoint | Mô tả |
+|--------|----------|--------|
+| `GET` | `/api/sr-zones/{symbol}` | Các vùng Support/Resistance đang active |
+| `GET` | `/api/sr-zones/{symbol}/distance?price=85000` | Gọi `get_distance_to_nearest_sr()` |
+
+#### Nhóm Benchmark — Hỗ trợ báo cáo
+
+| Method | Endpoint | Mô tả |
+|--------|----------|--------|
+| `POST` | `/api/benchmark/explain` | Chạy `EXPLAIN ANALYZE` cho query bất kỳ, trả về query plan |
+| `GET` | `/api/benchmark/stats` | Tóm tắt từ `pg_stat_statements` |
+
+### 14.4 Thiết kế kỹ thuật
+
+**DB Connection Pool (lifespan):**
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+import psycopg_pool
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = psycopg_pool.AsyncConnectionPool(
+        conninfo=DATABASE_URL, min_size=2, max_size=10
+    )
+    yield
+    await app.state.pool.close()
+
+app = FastAPI(lifespan=lifespan)
+```
+
+**Dependency Injection:**
+
+```python
+from fastapi import Depends, Request
+
+async def get_db_conn(request: Request):
+    async with request.app.state.pool.connection() as conn:
+        yield conn
+```
+
+**ETL Background Task pattern:**
+
+```python
+from fastapi import BackgroundTasks
+from uuid import uuid4
+
+# In-memory job store (đủ cho demo; production dùng Redis/DB)
+etl_jobs: dict[str, dict] = {}
+
+@router.post("/api/etl/backfill")
+async def backfill(req: BackfillRequest, bg: BackgroundTasks):
+    job_id = str(uuid4())
+    etl_jobs[job_id] = {"status": "running", "progress": 0}
+    bg.add_task(run_backfill, job_id, req)
+    return {"job_id": job_id, "status": "started"}
+
+@router.get("/api/etl/status/{job_id}")
+async def etl_status(job_id: str):
+    return etl_jobs.get(job_id, {"status": "not_found"})
+```
+
+### 14.5 Dependencies cần thêm
+
+```bash
+uv add uvicorn psycopg-pool
+# psycopg[binary] đã có sẵn; psycopg-pool cho async connection pool
+# fastapi đã có sẵn trong pyproject.toml
+```
+
+### 14.6 Chạy API server
+
+```bash
+uv run uvicorn api.main:app --reload --port 8000
+# Swagger UI: http://localhost:8000/docs
+```
+
+---
+
+## 15. DEMO LAYER — Streamlit Dashboard
+
+### 15.1 Mục đích
+
+Visualization layer cho demo bảo vệ đề tài — trực quan hóa dữ liệu OHLCV, so sánh mẫu hình tương đồng, và hiển thị kết quả RAC pipeline. Streamlit giao tiếp với PostgreSQL **thông qua FastAPI**, không kết nối DB trực tiếp.
+
+### 15.2 Các trang chính
+
+#### Trang 1: OHLCV Explorer (`1_ohlcv_chart.py`)
+
+- **Input:** Dropdown chọn symbol (từ `GET /api/symbols`), date range picker
+- **Chart chính:** Plotly Candlestick + Volume bar phía dưới
+- **Overlay:** S/R zones hiển thị dưới dạng horizontal lines (từ `GET /api/sr-zones/{symbol}`)
+- **Data source:** `GET /api/ohlcv/{symbol}?start=...&end=...`
+
+#### Trang 2: Similar Patterns (`2_similar_patterns.py`) ★ Highlight của đề tài
+
+- **Input:** User chọn symbol + khoảng thời gian (30 phiên) trên chart, hoặc chọn embedding ID có sẵn
+- **API call:** `POST /api/rac/similar-patterns`
+- **Hiển thị:**
+
+```
+┌─────────────────────────────────────────────────┐
+│  Query Window (VCB, 2024-03-01 → 2024-04-11)   │
+│  [========= Candlestick Chart =========]        │
+├────────────────┬────────────────┬───────────────┤
+│  Neighbor #1   │  Neighbor #2   │  Neighbor #3  │
+│  VCB 2021-06   │  FPT 2023-01   │  VNM 2020-11  │
+│  dist: 0.08    │  dist: 0.12    │  dist: 0.15   │
+│  label: UP ↑   │  label: UP ↑   │  label: DOWN ↓│
+│  [mini chart]  │  [mini chart]  │  [mini chart] │
+├────────────────┴────────────────┴───────────────┤
+│  Label Distribution         │  Confidence: 70%  │
+│  ██████████ UP: 65%                             │
+│  ████ DOWN: 20%                                 │
+│  ███ NEUTRAL: 15%                               │
+└─────────────────────────────────────────────────┘
+```
+
+- **Mini charts:** Mỗi neighbor hiển thị normalized price overlay (cùng scale 0–1) để so sánh hình dáng trực quan
+- **Bảng chi tiết:** neighbor_id, symbol, cosine_distance, label, future_return, window_start/end
+
+#### Trang 3: RAC Prediction (`3_rac_prediction.py`)
+
+- **API call:** `POST /api/rac/full-context` (★ Hybrid Query)
+- **Hiển thị 3 blocks** mapping trực tiếp với output của `compute_full_rac_context()`:
+
+| Block | Nội dung | Visualization |
+|-------|----------|---------------|
+| **Block 1 — KNN Stats** | total_neighbors, avg_cosine_dist, label_distribution, dominant_label | Pie chart (label dist) + metric cards |
+| **Block 2 — S/R Context** | dist_to_support, dist_to_resistance, sr_position_ratio | Gauge chart (0.0 = sát support ↔ 1.0 = sát resistance) |
+| **Block 3 — Evidence** | neighbor_ids, link sang trang Similar Patterns | Bảng IDs + nút "Xem chi tiết" |
+
+- **Ý nghĩa DB:** Trang này minh chứng Hybrid Query — một lần gọi API trả về kết quả từ cả HNSW Index Scan và B-Tree Index Scan.
+
+#### Trang 4: Benchmark Dashboard (`4_benchmark.py`)
+
+- **Mục đích:** Trực quan hóa kết quả benchmark cho báo cáo
+- **Charts:**
+  - Bar chart: HNSW vs SeqScan latency (ms)
+  - Bar chart: In-DB vs App-side computing (end-to-end time + bytes transferred)
+  - Heatmap: HNSW parameter sweep (m × ef_construction → Recall@K)
+  - Tree/text viewer: Raw `EXPLAIN ANALYZE` output từ `POST /api/benchmark/explain`
+- **Data source:** Kết quả benchmark lưu trong `benchmark/results/` hoặc query trực tiếp qua API
+
+### 15.3 Components tái sử dụng
+
+```python
+# components/candlestick.py
+def plot_candlestick(df, title, sr_zones=None):
+    """Plotly candlestick + volume + optional S/R horizontal lines."""
+    ...
+
+# components/similarity.py
+def plot_pattern_overlay(query_df, neighbor_dfs):
+    """Normalized price overlay: nhiều patterns cùng scale [0,1]
+    để so sánh hình dáng bất kể mức giá tuyệt đối."""
+    ...
+```
+
+### 15.4 Dependencies cần thêm
+
+```bash
+uv add --dev streamlit plotly httpx
+# httpx: HTTP client để Streamlit gọi FastAPI
+# plotly: Candlestick, pie chart, heatmap
+# streamlit: Dashboard framework
+```
+
+### 15.5 Chạy Streamlit
+
+```bash
+# Yêu cầu: FastAPI đang chạy ở port 8000
+uv run streamlit run streamlit_app/app.py --server.port 8501
+# Dashboard: http://localhost:8501
+```
+
+### 15.6 Thứ tự khởi động (Development)
+
+```bash
+# Terminal 1: Database
+docker compose --env-file .env up -d --build
+alembic upgrade head
+
+# Terminal 2: API server
+uv run uvicorn api.main:app --reload --port 8000
+
+# Terminal 3: Streamlit dashboard
+uv run streamlit run streamlit_app/app.py
+```
 
