@@ -42,6 +42,7 @@ datasets/
 artifacts/
 outputs/
 models/
+ml/model_store/
 reports/
 
 # OS / IDE
