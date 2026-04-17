@@ -42,7 +42,10 @@ def _make_ohlcv(n: int = 50, symbol: str = "VCB", start: str = "2024-01-02") -> 
 
 def _database_url() -> str:
     url = os.environ.get("DATABASE_URL")
-    assert url, "DATABASE_URL is required for integration tests"
+    if not url:
+        import pytest
+
+        pytest.skip("DATABASE_URL not set; skipping DB integration tests")
     return url
 
 
