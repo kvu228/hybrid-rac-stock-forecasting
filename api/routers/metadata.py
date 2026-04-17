@@ -1,4 +1,8 @@
-"""Metadata endpoints: S/R zones and distance calculations."""
+"""Metadata endpoints.
+
+Exposes support/resistance (S/R) zones and a helper endpoint that calls the
+in-DB function `get_distance_to_nearest_sr()`.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ async def get_sr_zones(
     symbol: str,
     active_only: bool = Query(default=True, description="Return only active zones"),
 ) -> list[dict[str, object]]:
-    """Return support/resistance zones for a symbol."""
+    """Return support/resistance zones for `symbol`."""
     if active_only:
         query = """
             SELECT id, symbol, zone_type, price_level, strength, detected_at, is_active
@@ -53,7 +57,7 @@ async def get_sr_distance(
     symbol: str,
     price: float = Query(..., description="Current price to measure distance from"),
 ) -> dict[str, object]:
-    """Call stored procedure ``get_distance_to_nearest_sr()`` and return distances."""
+    """Call `get_distance_to_nearest_sr()` and return distances for `symbol`."""
     row = await (
         await conn.execute(
             "SELECT * FROM get_distance_to_nearest_sr(%(symbol)s, %(price)s)",
