@@ -1,6 +1,6 @@
 # Implementation Plan: Hybrid-RAC-Stock
 
-> Cập nhật: 2026-04-16
+> Cập nhật: 2026-04-17
 
 ---
 
@@ -57,25 +57,22 @@
 
 > **Mục tiêu:** Train CNN Encoder → tạo embeddings → insert vào pgvector. Lưu ý: ML chỉ phục vụ tạo dữ liệu cho DB, không phải trọng tâm đề tài.
 
-- [ ] 4.1 **1D-CNN Encoder** (`ml/cnn_encoder.py`)
-    - [ ] Kiến trúc: Input [batch × 30 × 5] → Conv1D layers → Output vector(128)
-    - [ ] Framework: PyTorch
-    - [ ] Loss function: Triplet loss hoặc contrastive loss (để embedding gần nhau khi pattern giống)
-- [ ] 4.2 **Training Pipeline** (`ml/train_pipeline.py`)
-    - [ ] Dataloader từ sliding windows (Phase 3)
-    - [ ] Train trên tập train (80%)
-    - [ ] Save model weights → `ml/model_store/`
-- [ ] 4.3 **Embedding Generator** (`ml/embedding_generator.py`)
-    - [ ] Load trained CNN → encode toàn bộ windows → vector(128)
-    - [ ] Batch INSERT vào `pattern_embeddings` (với label + future_return)
-    - [ ] Verify HNSW index rebuilt / updated sau insert
-- [ ] 4.4 **SVM Classifier** (`ml/svm_classifier.py`)
-    - [ ] Input: original_embedding(128) + context_features (từ stored proc) + S/R metadata
-    - [ ] Output: predicted_label (0/1/2) + confidence
-    - [ ] Framework: scikit-learn
-    - [ ] Train trên tập train, evaluate trên tập test
-- [ ] 4.5 **Dependencies**
-    - [ ] `uv add torch scikit-learn numpy pandas`
+- [x] 4.1 **1D-CNN Encoder** (`ml/cnn_encoder.py`)
+    - [x] Kiến trúc: Input [batch × 30 × 5] → Conv1D layers → Output vector(128)
+    - [x] Framework: PyTorch
+    - [ ] Loss function: Triplet loss hoặc contrastive loss (để embedding gần nhau khi pattern giống) — pending (tối ưu chất lượng embedding)
+- [x] 4.2 **Training Pipeline** (`ml/train_pipeline.py`)
+    - [x] Tối thiểu: smoke-train để tạo encoder weights (phục vụ sinh embeddings cho DB)
+    - [ ] Train/evaluate theo train/test split Phase 3 — pending (nâng chất lượng ML, không phải trọng tâm DB)
+- [x] 4.3 **Embedding Generator** (`ml/embedding_generator.py`)
+    - [x] Load trained CNN → encode windows → vector(128)
+    - [x] Batch INSERT vào `pattern_embeddings` (kèm label + future_return)
+    - [ ] Verify HNSW index rebuilt / updated sau insert — pending (benchmark/monitoring)
+- [x] 4.4 **SVM Classifier** (`ml/svm_classifier.py`)
+    - [x] Framework: scikit-learn (wrapper train/load/predict)
+    - [ ] Train trên tập train, evaluate trên tập test — pending
+- [x] 4.5 **Dependencies**
+    - [x] `uv add torch scikit-learn numpy pandas`
 
 ---
 
@@ -83,23 +80,19 @@
 
 > **Mục tiêu:** Python wrapper gọi Stored Procedures + kết nối ML output → prediction pipeline hoàn chỉnh.
 
-- [ ] 5.1 **RAC Retriever** (`rac/retriever.py`)
-    - [ ] Wrapper gọi `find_similar_patterns()` từ Python
-    - [ ] Input: query embedding (128-d), k, threshold, optional symbol filter
-    - [ ] Output: danh sách neighbors (id, symbol, label, return, distance, window range)
-- [ ] 5.2 **RAC Context Enricher** (`rac/context_enricher.py`)
-    - [ ] Wrapper gọi `compute_rac_context()` — aggregate KNN stats
-    - [ ] Wrapper gọi `compute_full_rac_context()` — hybrid HNSW + B-Tree query
-    - [ ] Wrapper gọi `get_distance_to_nearest_sr()` — S/R distance
-- [ ] 5.3 **RAC Classifier** (`rac/rac_classifier.py`)
-    - [ ] Orchestrate: encode window → retrieve neighbors → enrich context → SVM predict
-    - [ ] Lưu kết quả vào `rac_predictions` (với neighbor_ids, label_dist, confidence)
-- [ ] 5.4 **Explainer** (`rac/explainer.py`)
-    - [ ] Format Top-K neighbors + OHLCV data gốc → human-readable evidence
-    - [ ] Dùng cho Streamlit visualization
-- [ ] 5.5 **Tests**
-    - [ ] Test retriever với mock embeddings (insert fake vectors → verify KNN results)
-    - [ ] Test full RAC pipeline end-to-end
+- [x] 5.1 **RAC Retriever** (`rac/retriever.py`)
+    - [x] Wrapper gọi `find_similar_patterns()` từ Python
+    - [x] Input: query embedding (128-d), k, threshold, optional symbol filter
+    - [x] Output: danh sách neighbors (id, symbol, label, return, distance, window range)
+- [x] 5.2 **RAC Context Enricher** (`rac/context_enricher.py`)
+    - [x] Wrapper gọi `compute_rac_context()` — aggregate KNN stats
+    - [x] Wrapper gọi `compute_full_rac_context()` — hybrid HNSW + B-Tree query
+- [x] 5.3 **RAC Classifier** (`rac/rac_classifier.py`)
+    - [x] Orchestrate: compute_full_rac_context → (optional) SVM predict → persist `rac_predictions`
+- [x] 5.4 **Explainer** (`rac/explainer.py`)
+    - [x] Format evidence payload (neighbors + label_distribution + confidence)
+- [x] 5.5 **Tests**
+    - [x] Test stored procedures + RAC endpoints integration
 
 ---
 
@@ -145,11 +138,12 @@
     - [x] `GET /api/symbols` — danh sách symbols trong DB
     - [x] `GET /api/ohlcv/{symbol}?start=...&end=...` — OHLCV theo time range
     - [x] `GET /api/ohlcv/{symbol}/latest?n=30` — N phiên gần nhất
-- [ ] 7.4 **RAC Router** (`api/routers/rac.py`)
-    - [ ] `POST /api/rac/similar-patterns` — gọi `find_similar_patterns()`
-    - [ ] `POST /api/rac/context` — gọi `compute_rac_context()`
-    - [ ] `POST /api/rac/full-context` — gọi `compute_full_rac_context()` (★ Hybrid Query)
-    - [ ] `GET /api/rac/predictions/{symbol}?limit=20` — lịch sử predictions
+- [x] 7.4 **RAC Router** (`api/routers/rac.py`)
+    - [x] `POST /api/rac/similar-patterns` — gọi `find_similar_patterns()`
+    - [x] `POST /api/rac/context` — gọi `compute_rac_context()`
+    - [x] `POST /api/rac/full-context` — gọi `compute_full_rac_context()` (★ Hybrid Query)
+    - [x] `POST /api/rac/predict` — dự báo + (optional) persist `rac_predictions`
+    - [x] `GET /api/rac/predictions/{symbol}?limit=20` — lịch sử predictions
 - [x] 7.5 **Metadata Router** (`api/routers/metadata.py`)
     - [x] `GET /api/sr-zones/{symbol}` — S/R zones active
     - [x] `GET /api/sr-zones/{symbol}/distance?price=...` — gọi `get_distance_to_nearest_sr()`
@@ -208,4 +202,4 @@ Phase 8 (Streamlit)  ←──  Phase 6 (Benchmark)
 - Phase 3 → 4 → 5 là đường critical path (phải có embeddings trước khi chạy RAC)
 - Phase 7 (API) có thể bắt đầu song song với Phase 4 cho phần OHLCV + ETL routers (không cần embeddings)
 - Phase 6 (Benchmark) cần Phase 5 hoàn thành để có dữ liệu embeddings đầy đủ
-- Phase 8 (Streamlit) bắt đầu sau khi API có ít nhất OHLCV + RAC endpointst
+- Phase 8 (Streamlit) bắt đầu sau khi API có ít nhất OHLCV + RAC endpoints

@@ -27,15 +27,24 @@ Hệ thống **nhận diện mẫu hình** và **dự báo chứng khoán** dự
 - **Phase 1** ✅ Infrastructure & DB Schema (TimescaleDB, pgvector, stored procedures, migrations)
 - **Phase 2** ✅ ETL Pipeline (Vnstock fetch → clean → bulk ingest, idempotent upsert)
 - **Phase 3** ✅ Feature Engineering (sliding windows, S/R detection, train/test split)
-- **Phase 4–8** — Xem `IMPLEMENTATION_PLAN.md`
+- **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
+- **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
+- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
+- **Phase 6, 8** — Xem `IMPLEMENTATION_PLAN.md`
 
 ## Chuẩn bị môi trường
 
 ### Yêu cầu
 
 - Docker Desktop
-- Python 3.13+
+- Python 3.12
 - `uv` (package manager)
+
+### 0) Cài dependencies (uv)
+
+```bash
+uv sync --dev
+```
 
 ### 1) Cấu hình biến môi trường
 
@@ -110,11 +119,16 @@ python -m db.seed_small_dataset
 
 ```bash
 # Backfill theo khoảng thời gian
-python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2
+python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2 --requests-per-minute 55
 
 # Incremental (tự lấy từ MAX(time) trong DB theo từng mã → end)
-python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2
+python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2 --requests-per-minute 55
 ```
+
+> **Chống rate limit (Community 60 req/phút):**
+> - Pipeline có **global rate limiter** dùng chung cho mọi thread + **retry/backoff** khi gặp 429.
+> - Mặc định `--requests-per-minute` lấy từ `VNSTOCK_REQUESTS_PER_MINUTE` hoặc **55** (để chừa headroom).
+> - `--rate-limit-burst` (mặc định 1) cho phép “burst” ngắn tối đa N request.
 
 ### Fetch full VN100 (lần đầu: 2010 → nay)
 
@@ -127,7 +141,8 @@ alembic upgrade head
 python -m etl.pipeline backfill \
   --symbols-file etl/tickers_vn100.txt \
   --start 2010-01-01 --end 2026-04-15 \
-  --chunk-days 365 --concurrency 4
+  --chunk-days 365 --concurrency 4 \
+  --requests-per-minute 55
 ```
 
 Các lần sau chỉ cần incremental:
@@ -135,8 +150,22 @@ Các lần sau chỉ cần incremental:
 ```bash
 python -m etl.pipeline incremental \
   --symbols-file etl/tickers_vn100.txt \
-  --end 2026-04-15 --chunk-days 365 --concurrency 4
+  --end 2026-04-15 --chunk-days 365 --concurrency 4 \
+  --requests-per-minute 55
 ```
+
+> **Windows PowerShell:** để xuống dòng, dùng backtick `` ` `` thay vì `\`.
+>
+> Ví dụ:
+>
+> ```powershell
+> uv run python -m etl.pipeline incremental `
+>   --symbols-file etl/tickers_vn100.txt `
+>   --end 2026-04-15 `
+>   --chunk-days 365 `
+>   --concurrency 4 `
+>   --requests-per-minute 55
+> ```
 
 ## Chạy Phase 3 (Feature Engineering & Preprocessing)
 
@@ -186,6 +215,36 @@ pytest -q
 
 ---
 
+## Chạy Phase 7 (FastAPI REST API)
+
+> API auto-load `.env` và cần `DATABASE_URL` trỏ tới PostgreSQL đã chạy + đã `alembic upgrade head`.
+
+### Chạy server
+
+```bash
+uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Mở docs:
+- Swagger UI: `http://localhost:8000/docs`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+### Endpoints đã có
+
+- `GET /api/health`
+- `GET /api/symbols`
+- `GET /api/ohlcv/{symbol}?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...`
+- `GET /api/ohlcv/{symbol}/latest?n=...`
+- `GET /api/sr-zones/{symbol}?active_only=true|false`
+- `GET /api/sr-zones/{symbol}/distance?price=...`
+- `POST /api/rac/similar-patterns`
+- `POST /api/rac/context`
+- `POST /api/rac/full-context`
+- `POST /api/rac/predict?persist=true|false`
+- `GET /api/rac/predictions/{symbol}?limit=...`
+
+---
+
 ## English
 
 This repo implements an **equity pattern recognition** and **stock forecasting** system built on a **hybrid database architecture** running on a **single PostgreSQL 16+** instance:
@@ -213,15 +272,22 @@ This repo implements an **equity pattern recognition** and **stock forecasting**
 - **Phase 1** ✅ Infrastructure & DB Schema (TimescaleDB, pgvector, stored procedures, migrations)
 - **Phase 2** ✅ ETL Pipeline (Vnstock fetch → clean → bulk ingest, idempotent upsert)
 - **Phase 3** ✅ Feature Engineering (sliding windows, S/R detection, train/test split)
-- **Phase 4–8** — See `IMPLEMENTATION_PLAN.md`
+- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR)
+- **Phase 4–6, 8** — See `IMPLEMENTATION_PLAN.md`
 
 ## Environment Setup
 
 ### Requirements
 
 - Docker Desktop
-- Python 3.13+
+- Python 3.12
 - `uv` (package manager)
+
+### 0) Install dependencies (uv)
+
+```bash
+uv sync --dev
+```
 
 ### 1) Configure environment
 
@@ -289,11 +355,16 @@ python -m db.seed_small_dataset
 
 ```bash
 # Backfill a date range
-python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2
+python -m etl.pipeline backfill --symbols VCB FPT --start 2024-01-01 --end 2024-03-31 --chunk-days 365 --concurrency 2 --requests-per-minute 55
 
 # Incremental (from MAX(time) in DB per symbol → end)
-python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2
+python -m etl.pipeline incremental --symbols VCB FPT --end 2026-04-15 --chunk-days 365 --concurrency 2 --requests-per-minute 55
 ```
+
+> **Rate limiting (Community 60 req/min):**
+> - The ETL has a **process-wide rate limiter** shared across all threads + **retry/backoff** on 429.
+> - By default, `--requests-per-minute` uses `VNSTOCK_REQUESTS_PER_MINUTE` or **55** (headroom).
+> - `--rate-limit-burst` (default 1) allows short bursts up to N requests.
 
 ### Fetch full VN100 (first run: 2010 → present)
 
@@ -305,7 +376,8 @@ alembic upgrade head
 python -m etl.pipeline backfill \
   --symbols-file etl/tickers_vn100.txt \
   --start 2010-01-01 --end 2026-04-15 \
-  --chunk-days 365 --concurrency 4
+  --chunk-days 365 --concurrency 4 \
+  --requests-per-minute 55
 ```
 
 After that, use incremental mode:
@@ -313,8 +385,11 @@ After that, use incremental mode:
 ```bash
 python -m etl.pipeline incremental \
   --symbols-file etl/tickers_vn100.txt \
-  --end 2026-04-15 --chunk-days 365 --concurrency 4
+  --end 2026-04-15 --chunk-days 365 --concurrency 4 \
+  --requests-per-minute 55
 ```
+
+> **Windows PowerShell:** use backtick `` ` `` for line continuation (not `\`).
 
 ## Run Phase 3 (Feature Engineering & Preprocessing)
 
@@ -361,3 +436,33 @@ ruff check .
 mypy .
 pytest -q
 ```
+
+---
+
+## Run Phase 7 (FastAPI REST API)
+
+> The API auto-loads `.env` and requires `DATABASE_URL` pointing to a running PostgreSQL with migrations applied (`alembic upgrade head`).
+
+### Start the server
+
+```bash
+uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Open docs:
+- Swagger UI: `http://localhost:8000/docs`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+### Available endpoints
+
+- `GET /api/health`
+- `GET /api/symbols`
+- `GET /api/ohlcv/{symbol}?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...`
+- `GET /api/ohlcv/{symbol}/latest?n=...`
+- `GET /api/sr-zones/{symbol}?active_only=true|false`
+- `GET /api/sr-zones/{symbol}/distance?price=...`
+- `POST /api/rac/similar-patterns`
+- `POST /api/rac/context`
+- `POST /api/rac/full-context`
+- `POST /api/rac/predict?persist=true|false`
+- `GET /api/rac/predictions/{symbol}?limit=...`
