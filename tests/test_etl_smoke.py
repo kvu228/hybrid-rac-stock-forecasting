@@ -10,7 +10,8 @@ from etl.ingestion import ingest_stock_ohlcv
 
 def _database_url() -> str:
     url = os.environ.get("DATABASE_URL")
-    assert url, "DATABASE_URL is required for integration tests"
+    if not url:
+        pytest.skip("DATABASE_URL not set; skipping DB integration tests")
     return url
 
 

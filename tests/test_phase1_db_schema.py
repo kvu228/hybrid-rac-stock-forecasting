@@ -1,11 +1,13 @@
 import os
 
 import sqlalchemy as sa
+import pytest
 
 
 def _engine() -> sa.Engine:
     url = os.environ.get("DATABASE_URL")
-    assert url, "DATABASE_URL is required for DB integration tests"
+    if not url:
+        pytest.skip("DATABASE_URL not set; skipping DB integration tests")
     return sa.create_engine(url, pool_pre_ping=True)
 
 
