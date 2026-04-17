@@ -1,4 +1,8 @@
-"""OHLCV endpoints: symbol listing, time-range query, latest sessions."""
+"""OHLCV endpoints.
+
+Read-only endpoints over the TimescaleDB hypertable `stock_ohlcv`, optimized by
+the `(symbol, time)` index/chunk exclusion.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ router = APIRouter()
 
 @router.get("/symbols", response_model=list[SymbolItem])
 async def list_symbols(conn: DbConn) -> list[dict[str, object]]:
-    """Return all symbols with row counts and date ranges."""
+    """List symbols currently present in `stock_ohlcv` with basic stats."""
     rows = await conn.execute(
         """
         SELECT symbol, COUNT(*) AS row_count, MIN(time) AS min_time, MAX(time) AS max_time
@@ -37,7 +41,7 @@ async def get_ohlcv(
     end: date | None = Query(default=None, description="End date (inclusive)"),
     limit: int = Query(default=5000, ge=1, le=50000, description="Max rows"),
 ) -> list[dict[str, object]]:
-    """Return OHLCV rows for a symbol within an optional date range."""
+    """Return OHLCV rows for `symbol` within an optional date range."""
     clauses = ["symbol = %(symbol)s"]
     params: dict[str, object] = {"symbol": symbol, "limit": limit}
 
@@ -72,7 +76,7 @@ async def get_ohlcv_latest(
     symbol: str,
     n: int = Query(default=30, ge=1, le=1000, description="Number of latest sessions"),
 ) -> list[dict[str, object]]:
-    """Return the N most recent OHLCV rows for a symbol (ordered oldest→newest)."""
+    """Return the latest `n` OHLCV rows for `symbol` (ordered oldest→newest)."""
     rows = await (
         await conn.execute(
             """
