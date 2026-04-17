@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from db.seed_small_dataset import main as seed_small_dataset
 from etl.data_cleaner import clean_ohlcv
 from etl.ingestion import ingest_stock_ohlcv
-from etl.vnstock_fetcher import fetch_ohlcv
+from etl.vnstock_fetcher import configure_rate_limiter, fetch_ohlcv
 from dotenv import load_dotenv
 
 
@@ -277,6 +277,18 @@ def main() -> None:
     p_backfill.add_argument("--end", type=_parse_date, required=True, help="End date (YYYY-MM-DD)")
     p_backfill.add_argument("--chunk-days", type=int, default=365, help="Split fetch range into N-day chunks (default: 365)")
     p_backfill.add_argument("--concurrency", type=int, default=1, help="Number of symbols to fetch in parallel (default: 1)")
+    p_backfill.add_argument(
+        "--requests-per-minute",
+        type=int,
+        default=int((os.getenv("VNSTOCK_REQUESTS_PER_MINUTE") or "55").strip() or "55"),
+        help="Global VNStock request budget across threads (default: env VNSTOCK_REQUESTS_PER_MINUTE or 55)",
+    )
+    p_backfill.add_argument(
+        "--rate-limit-burst",
+        type=int,
+        default=int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1"),
+        help="Allow short bursts up to N requests (default: env VNSTOCK_RATE_LIMIT_BURST or 1)",
+    )
     p_backfill.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
     p_incr = sub.add_parser("incremental", help="Fetch only missing dates since max(time) in DB per symbol")
@@ -290,6 +302,18 @@ def main() -> None:
     )
     p_incr.add_argument("--chunk-days", type=int, default=365, help="Split fetch range into N-day chunks (default: 365)")
     p_incr.add_argument("--concurrency", type=int, default=1, help="Number of symbols to fetch in parallel (default: 1)")
+    p_incr.add_argument(
+        "--requests-per-minute",
+        type=int,
+        default=int((os.getenv("VNSTOCK_REQUESTS_PER_MINUTE") or "55").strip() or "55"),
+        help="Global VNStock request budget across threads (default: env VNSTOCK_REQUESTS_PER_MINUTE or 55)",
+    )
+    p_incr.add_argument(
+        "--rate-limit-burst",
+        type=int,
+        default=int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1"),
+        help="Allow short bursts up to N requests (default: env VNSTOCK_RATE_LIMIT_BURST or 1)",
+    )
     p_incr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
     # --- Phase 3: Feature Engineering commands ---
@@ -348,6 +372,11 @@ def main() -> None:
 
     concurrency = max(1, int(args.concurrency))
     chunk_days = int(args.chunk_days)
+
+    # Configure a process-wide limiter so threads share the same budget.
+    # Community plan is 60 rpm, but default is 55 to leave headroom.
+    if args.cmd in {"backfill", "incremental"}:
+        configure_rate_limiter(requests_per_minute=max(1, int(args.requests_per_minute)), burst=max(1, int(args.rate_limit_burst)))
 
     results: list[tuple[str, int, int, int, int]] = []
 
