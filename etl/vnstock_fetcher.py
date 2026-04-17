@@ -2,12 +2,72 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import random
+import threading
+import time
 from typing import Iterable, Literal
 
 import pandas as pd
 
 
 Provider = Literal["vci"]
+
+
+class _RateLimiter:
+    """Thread-safe process-wide request rate limiter."""
+
+    def __init__(self, rpm: int, burst: int = 1) -> None:
+        if rpm <= 0:
+            raise ValueError("requests_per_minute must be > 0")
+        self._interval_s = 60.0 / float(rpm)
+        self._burst = max(1, int(burst))
+        self._lock = threading.Lock()
+        self._next_allowed = time.monotonic()
+        self._available = self._burst
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+
+                # Refill burst tokens based on time elapsed.
+                if self._available < self._burst:
+                    # Number of full intervals elapsed since last scheduled time.
+                    intervals = int(max(0.0, now - self._next_allowed) / self._interval_s)
+                    if intervals > 0:
+                        self._available = min(self._burst, self._available + intervals)
+                        self._next_allowed = now
+
+                if self._available > 0 and now >= self._next_allowed:
+                    self._available -= 1
+                    self._next_allowed = max(self._next_allowed, now) + self._interval_s
+                    return
+
+                sleep_for = max(0.0, self._next_allowed - now)
+
+            time.sleep(min(sleep_for, 1.0))
+
+
+_rate_limiter: _RateLimiter | None = None
+
+
+def configure_rate_limiter(*, requests_per_minute: int, burst: int = 1) -> None:
+    """Configure the global limiter used by `fetch_ohlcv`."""
+
+    global _rate_limiter
+    _rate_limiter = _RateLimiter(rpm=requests_per_minute, burst=burst)
+
+
+def _is_rate_limited_error(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return (
+        "429" in msg
+        or "too many request" in msg
+        or "too many requests" in msg
+        or "rate limit" in msg
+        or "ratelimit" in msg
+        or "request limit" in msg
+    )
 
 
 def _is_no_data_error(err: BaseException) -> bool:
@@ -75,14 +135,30 @@ def fetch_ohlcv(req: FetchRequest) -> pd.DataFrame:
     from vnstock import Quote
 
     q = Quote(source="vci", symbol=req.symbol)
-    try:
-        df = q.history(start=req.start.isoformat(), end=req.end.isoformat(), interval="1D")
-    except Exception as e:
-        # vnstock may raise (and wrap with tenacity RetryError) when there is no data for
-        # the symbol or date range. Treat it as an empty result so ETL can proceed.
-        if _is_no_data_error(e):
-            return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
-        raise
+
+    df = pd.DataFrame()
+    max_attempts = 6
+    base_backoff_s = 1.0
+    for attempt in range(1, max_attempts + 1):
+        if _rate_limiter is not None:
+            _rate_limiter.acquire()
+        try:
+            df = q.history(start=req.start.isoformat(), end=req.end.isoformat(), interval="1D")
+            break
+        except Exception as e:
+            # vnstock may raise (and wrap with tenacity RetryError) when there is no data for
+            # the symbol or date range. Treat it as an empty result so ETL can proceed.
+            if _is_no_data_error(e):
+                return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
+
+            if _is_rate_limited_error(e) and attempt < max_attempts:
+                sleep_s = min(60.0, base_backoff_s * (2 ** (attempt - 1)))
+                sleep_s *= 0.75 + 0.5 * random.random()  # jitter in [0.75, 1.25]
+                time.sleep(sleep_s)
+                continue
+
+            raise
+
     if df.empty:
         return pd.DataFrame(columns=["time", "symbol", "open", "high", "low", "close", "volume"])
 
