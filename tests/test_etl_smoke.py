@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import sqlalchemy as sa
 
 from etl.data_cleaner import clean_ohlcv
