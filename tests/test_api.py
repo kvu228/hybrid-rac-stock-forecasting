@@ -182,3 +182,41 @@ async def test_sr_zones_roundtrip(client: httpx.AsyncClient) -> None:
                 sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"),
                 {"sym": symbol},
             )
+
+
+@pytest.mark.anyio
+async def test_purge_inactive_sr_via_api(client: httpx.AsyncClient) -> None:
+    """POST purge-inactive removes inactive rows for listed symbols."""
+    _require_db()
+    symbol = "__TEST_API_PURGE_SR__"
+
+    with _engine().begin() as conn:
+        conn.execute(sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"), {"sym": symbol})
+        conn.execute(
+            sa.text(
+                "INSERT INTO support_resistance_zones (symbol, zone_type, price_level, strength, is_active) VALUES "
+                "(:sym, 'SUPPORT', 1.0, 1.0, FALSE), (:sym, 'RESISTANCE', 9.0, 2.0, TRUE)"
+            ),
+            {"sym": symbol},
+        )
+
+    try:
+        resp = await client.post("/api/sr-zones/purge-inactive", json={"symbols": [symbol]})
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted_count": 1}
+
+        listed = await client.get(f"/api/sr-zones/{symbol}", params={"active_only": False})
+        assert listed.status_code == 200
+        zones = listed.json()
+        assert len(zones) == 1
+        assert zones[0]["is_active"] is True
+    finally:
+        with _engine().begin() as conn:
+            conn.execute(sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"), {"sym": symbol})
+
+
+@pytest.mark.anyio
+async def test_purge_inactive_sr_validation(client: httpx.AsyncClient) -> None:
+    _require_db()
+    resp = await client.post("/api/sr-zones/purge-inactive", json={})
+    assert resp.status_code == 422
