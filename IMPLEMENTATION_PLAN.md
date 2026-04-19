@@ -96,27 +96,27 @@
 
 ---
 
-## Phase 6: Benchmarking
+## Phase 6: Benchmarking ✅
 
 > **Mục tiêu:** Đo lường hiệu suất DB — đây là phần cốt lõi của báo cáo. Mọi claim phải có `EXPLAIN ANALYZE`.
 
-- [ ] 6.1 **HNSW vs Sequential Scan** (`benchmark/hnsw_vs_seqscan.py`)
-    - [ ] Tắt/bật index scan → so sánh latency
-    - [ ] Đo: query latency P50/P95/P99, pages read (buffers hit/read), Recall@K vs exact
-- [ ] 6.2 **Hybrid Search** (`benchmark/hybrid_search_bench.py`)
-    - [ ] So sánh: HNSW only vs B-Tree filter + HNSW
-    - [ ] Chạy `EXPLAIN ANALYZE` → capture execution plan
-- [ ] 6.3 **In-DB vs App-side Computing** (`benchmark/indb_vs_appside.py`)
-    - [ ] Phương án A: Query K raw vectors → Python tính stats
-    - [ ] Phương án B: Gọi `compute_rac_context()` → DB trả kết quả tổng hợp
-    - [ ] Đo: end-to-end time, bytes transferred, round-trips
-- [ ] 6.4 **HNSW Parameter Sweep** (`benchmark/hnsw_param_sweep.py`)
-    - [ ] Grid: m=[8,16,32,64] × ef_construction=[64,128,200,400] × ef_search=[40,100,200,400]
-    - [ ] Đo: index build time, index size, query latency, Recall@10/20, RAM usage
-- [ ] 6.5 **TimescaleDB Chunking** (`benchmark/chunk_size_bench.py`)
-    - [ ] So sánh chunk intervals: 1 week, 1 month, 3 months
-    - [ ] Đo: range query latency, compression ratio, chunk exclusion effectiveness
-- [ ] 6.6 **Export kết quả** → `benchmark/results/` (CSV/JSON cho báo cáo + Streamlit)
+- [x] 6.1 **HNSW vs Sequential Scan** (`benchmark/hnsw_vs_seqscan.py`)
+    - [x] Tắt/bật index scan → so sánh latency
+    - [x] Đo: query latency P50/P95/P99, pages read (buffers hit/read), Recall@K vs exact
+- [x] 6.2 **Hybrid Search** (`benchmark/hybrid_search_bench.py`)
+    - [x] So sánh: HNSW only vs B-Tree filter + HNSW
+    - [x] Chạy `EXPLAIN ANALYZE` → capture execution plan
+- [x] 6.3 **In-DB vs App-side Computing** (`benchmark/indb_vs_appside.py`)
+    - [x] Phương án A: Query K raw vectors → Python tính stats
+    - [x] Phương án B: Gọi `compute_rac_context()` → DB trả kết quả tổng hợp
+    - [x] Đo: end-to-end time, bytes transferred, round-trips
+- [x] 6.4 **HNSW Parameter Sweep** (`benchmark/hnsw_param_sweep.py`)
+    - [x] Grid: m=[8,16,32,64] × ef_construction=[64,128,200,400] × ef_search=[40,100,200,400]
+    - [x] Đo: index build time, index size, query latency, Recall@10/20, RAM usage
+- [x] 6.5 **TimescaleDB Chunking** (`benchmark/chunk_size_bench.py`)
+    - [x] So sánh chunk intervals: 1 week, 1 month, 3 months
+    - [x] Đo: range query latency, compression ratio, chunk exclusion effectiveness
+- [x] 6.6 **Export kết quả** → `benchmark/results/` (CSV/JSON cho báo cáo + Streamlit)
 
 ---
 
