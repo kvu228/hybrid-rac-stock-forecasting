@@ -2,6 +2,12 @@ UV ?= uv
 PY ?= $(UV) run python
 ALEMBIC ?= $(UV) run alembic
 UVICORN ?= $(UV) run uvicorn
+STREAMLIT ?= $(UV) run streamlit
+
+# Phase 8: Streamlit (calls FastAPI; default API URL overridable)
+ST_APP ?= streamlit_app/app.py
+ST_PORT ?= 8501
+ST_HOST ?= 127.0.0.1
 
 COMPOSE ?= docker compose
 COMPOSE_ENV ?= --env-file .env
@@ -61,6 +67,7 @@ help:
 	@echo "  make migrate              - alembic upgrade head"
 	@echo "  make seed                 - seed small fixture dataset"
 	@echo "  make api                  - run FastAPI (reload)"
+	@echo "  make streamlit            - run Streamlit dashboard (Phase 8; needs API + ST_PORT/ST_HOST)"
 	@echo "  make etl-backfill-vn100   - backfill full VN100 list to END (defaults to today)"
 	@echo "  make etl-incremental-vn100 - incremental update to END"
 	@echo "  make windows-ps-backfill-vn100 - PowerShell one-liner (no line-continuation pitfalls)"
@@ -140,6 +147,10 @@ seed:
 .PHONY: api
 api:
 	$(UVICORN) api.main:app --reload --host 0.0.0.0 --port 8000
+
+.PHONY: streamlit
+streamlit:
+	$(STREAMLIT) run $(ST_APP) --server.address $(ST_HOST) --server.port $(ST_PORT)
 
 .PHONY: etl-backfill-vn100
 etl-backfill-vn100:
