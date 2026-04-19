@@ -202,7 +202,7 @@ def train_from_ohlcv(
     *,
     encoder_cfg: EncoderConfig = EncoderConfig(),
     train_cfg: TrainConfig = TrainConfig(),
-) -> tuple[CNNEncoder, dict[str, float]]:
+) -> tuple[CNNEncoder, dict[str, float | str]]:
     """Train encoder with CE+linear head (default) or triplet loss on embeddings."""
     _set_seed(train_cfg.seed)
     if train_cfg.loss not in {"ce", "triplet"}:
@@ -235,7 +235,7 @@ def train_from_ohlcv(
 
     if train_cfg.loss == "triplet":
         encoder, last_loss = _train_encoder_triplet(train_loader, encoder, train_cfg)
-        metrics = {
+        metrics: dict[str, float | str] = {
             "train_windows": float(len(train_ds)),
             "test_windows": float(len(test_ds)) if test_ds is not None else 0.0,
             "last_train_loss": float(last_loss),

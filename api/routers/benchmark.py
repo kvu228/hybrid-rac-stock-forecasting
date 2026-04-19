@@ -101,7 +101,7 @@ LIMIT %(k)s
             (sym,),
         )
         r3 = await cur_px.fetchone()
-        price = float(r3[0]) if r3 and r3[0] is not None else 1.0
+        price = float(cast(Any, r3[0])) if r3 and r3[0] is not None else 1.0
 
         inner = """
 SELECT * FROM compute_full_rac_context(%(qv)s::vector, %(sym)s, %(px)s, %(k)s)
@@ -151,10 +151,10 @@ async def benchmark_stats(conn: DbConn) -> dict[str, object]:
         statements.append(
             {
                 "query": (q[:500] + "…") if len(q) > 500 else q,
-                "calls": int(r[1]) if r[1] is not None else 0,
-                "total_exec_time": float(r[2]) if r[2] is not None else 0.0,
-                "mean_exec_time": float(r[3]) if r[3] is not None else 0.0,
-                "rows": int(r[4]) if r[4] is not None else 0,
+                "calls": int(cast(Any, r[1])) if r[1] is not None else 0,
+                "total_exec_time": float(cast(Any, r[2])) if r[2] is not None else 0.0,
+                "mean_exec_time": float(cast(Any, r[3])) if r[3] is not None else 0.0,
+                "rows": int(cast(Any, r[4])) if r[4] is not None else 0,
             }
         )
     return {"available": True, "hint": None, "statements": statements}
