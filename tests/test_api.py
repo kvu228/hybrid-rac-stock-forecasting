@@ -5,9 +5,10 @@ Requires a running DB with migrations applied and seed data loaded.
 
 from __future__ import annotations
 
+import asyncio
 import os
-
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import pytest
 import httpx
@@ -220,3 +221,91 @@ async def test_purge_inactive_sr_validation(client: httpx.AsyncClient) -> None:
     _require_db()
     resp = await client.post("/api/sr-zones/purge-inactive", json={})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# ETL jobs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_etl_seed_job_completes(client: httpx.AsyncClient) -> None:
+    _require_db()
+    resp = await client.post("/api/etl/seed")
+    assert resp.status_code == 200
+    job_id = resp.json()["job_id"]
+    status = "queued"
+    last: dict[str, object] = {}
+    for _ in range(60):
+        st = await client.get(f"/api/etl/status/{job_id}")
+        assert st.status_code == 200
+        last = st.json()
+        status = str(last.get("status", ""))
+        if status in {"completed", "failed"}:
+            break
+        await asyncio.sleep(0.05)
+    assert status == "completed", last.get("error")
+
+
+@pytest.mark.anyio
+async def test_etl_status_unknown_job(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/api/etl/status/00000000-0000-0000-0000-000000000000")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_benchmark_results_list(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/api/benchmark/results")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+
+@pytest.mark.anyio
+async def test_benchmark_stats(client: httpx.AsyncClient) -> None:
+    _require_db()
+    resp = await client.get("/api/benchmark/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "available" in body
+
+
+@pytest.mark.anyio
+async def test_benchmark_explain_hnsw_knn(client: httpx.AsyncClient) -> None:
+    _require_db()
+    with _engine().connect() as conn:
+        n = conn.execute(sa.text("SELECT COUNT(*) FROM pattern_embeddings")).scalar()
+    if not n:
+        pytest.skip("pattern_embeddings empty")
+    resp = await client.post("/api/benchmark/explain", json={"query_kind": "hnsw_knn", "k": 5})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "plan_text" in data
+    assert len(data["plan_text"]) > 10
+
+
+# ---------------------------------------------------------------------------
+# RAC query embedding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_rac_query_embedding(client: httpx.AsyncClient) -> None:
+    _require_db()
+    if not Path("ml/model_store/cnn_encoder.pt").is_file():
+        pytest.skip("cnn_encoder.pt not present")
+    o = await client.get("/api/ohlcv/VCB/latest", params={"n": 40})
+    assert o.status_code == 200
+    bars = o.json()
+    if len(bars) < 30:
+        pytest.skip("need >=30 OHLCV bars for VCB")
+    we = bars[-1]["time"]
+    q = await client.post("/api/rac/query-embedding", json={"symbol": "VCB", "window_end": we})
+    assert q.status_code == 200
+    payload = q.json()
+    assert len(payload["query_embedding"]) == 128
+    assert len(payload["ohlcv"]) == 30
