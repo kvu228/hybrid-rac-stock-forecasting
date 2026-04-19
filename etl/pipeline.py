@@ -5,11 +5,12 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import sqlalchemy as sa
 
-from db.seed_small_dataset import main as seed_small_dataset
+from db.seed_small_dataset import seed_fixture_ohlcv
 from etl.data_cleaner import clean_ohlcv
 from etl.ingestion import ingest_stock_ohlcv
 from etl.vnstock_fetcher import configure_rate_limiter, fetch_ohlcv
@@ -59,9 +60,10 @@ def _load_dotenv_if_present() -> None:
     load_dotenv(override=False)
 
 
-def _load_symbols(symbols: list[str] | None, symbols_file: str | None) -> list[str]:
+def parse_symbols_list(symbols: list[str] | None, symbols_file: str | None) -> list[str]:
+    """Resolve symbol list from CLI/API. Raises ``ValueError`` on invalid input."""
     if symbols and symbols_file:
-        raise SystemExit("Use either --symbols or --symbols-file, not both")
+        raise ValueError("Use either symbols or symbols_file, not both")
 
     if symbols_file:
         p = Path(symbols_file)
@@ -73,12 +75,19 @@ def _load_symbols(symbols: list[str] | None, symbols_file: str | None) -> list[s
                 continue
             out.append(s)
         if not out:
-            raise SystemExit("No symbols found in --symbols-file")
+            raise ValueError("No symbols found in symbols_file")
         return out
 
     if not symbols:
-        raise SystemExit("Missing symbols. Provide --symbols or --symbols-file")
+        raise ValueError("Missing symbols. Provide symbols or symbols_file")
     return [s.strip() for s in symbols if s.strip()]
+
+
+def _load_symbols(symbols: list[str] | None, symbols_file: str | None) -> list[str]:
+    try:
+        return parse_symbols_list(symbols, symbols_file)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
 
 
 def _date_chunks(start: date, end: date, chunk_days: int) -> list[tuple[date, date]]:
@@ -273,6 +282,123 @@ def _cmd_purge_inactive_sr(args: argparse.Namespace, database_url: str) -> None:
     print(f"purge-inactive-sr deleted_rows={n}")
 
 
+def run_seed_small_dataset(*, database_url: str | None = None) -> dict[str, int]:
+    """Load the small OHLCV fixture into ``stock_ohlcv``. Requires ``DATABASE_URL`` unless passed explicitly."""
+    _load_dotenv_if_present()
+    stats = seed_fixture_ohlcv(database_url=database_url)
+    return {"staged_rows": stats.staged_rows, "inserted_rows": stats.inserted_rows}
+
+
+def _aggregate_ingest_results(results: list[tuple[str, int, int, int, int]]) -> dict[str, Any]:
+    results = sorted(results, key=lambda x: x[0])
+    per_symbol = [
+        {
+            "symbol": sym,
+            "fetched": fetched,
+            "cleaned_rows": cleaned_rows,
+            "dropped_duplicates": dropped,
+            "inserted_or_updated": upserted,
+        }
+        for sym, fetched, cleaned_rows, dropped, upserted in results
+    ]
+    return {
+        "symbols_processed": len(results),
+        "total_fetched": sum(r[1] for r in results),
+        "total_cleaned_rows": sum(r[2] for r in results),
+        "total_dropped_duplicates": sum(r[3] for r in results),
+        "total_inserted_or_updated": sum(r[4] for r in results),
+        "per_symbol": per_symbol,
+    }
+
+
+def run_backfill(
+    database_url: str,
+    symbols: list[str],
+    start: date,
+    end: date,
+    *,
+    chunk_days: int = 365,
+    concurrency: int = 1,
+    requests_per_minute: int | None = None,
+    rate_limit_burst: int | None = None,
+) -> dict[str, Any]:
+    _load_dotenv_if_present()
+    _register_vnstock_user_from_env()
+    rpm = (
+        int(requests_per_minute)
+        if requests_per_minute is not None
+        else int((os.getenv("VNSTOCK_REQUESTS_PER_MINUTE") or "55").strip() or "55")
+    )
+    burst = (
+        int(rate_limit_burst)
+        if rate_limit_burst is not None
+        else int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1")
+    )
+    configure_rate_limiter(requests_per_minute=max(1, rpm), burst=max(1, burst))
+    concurrency = max(1, int(concurrency))
+    chunk_days = int(chunk_days)
+    results: list[tuple[str, int, int, int, int]] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {
+            ex.submit(_fetch_clean_ingest_one, sym, start, end, database_url, chunk_days): sym for sym in symbols
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    out = _aggregate_ingest_results(results)
+    out["mode"] = "backfill"
+    out["start"] = str(start)
+    out["end"] = str(end)
+    return out
+
+
+def run_incremental(
+    database_url: str,
+    symbols: list[str],
+    end: date,
+    *,
+    chunk_days: int = 365,
+    concurrency: int = 1,
+    requests_per_minute: int | None = None,
+    rate_limit_burst: int | None = None,
+) -> dict[str, Any]:
+    _load_dotenv_if_present()
+    _register_vnstock_user_from_env()
+    rpm = (
+        int(requests_per_minute)
+        if requests_per_minute is not None
+        else int((os.getenv("VNSTOCK_REQUESTS_PER_MINUTE") or "55").strip() or "55")
+    )
+    burst = (
+        int(rate_limit_burst)
+        if rate_limit_burst is not None
+        else int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1")
+    )
+    configure_rate_limiter(requests_per_minute=max(1, rpm), burst=max(1, burst))
+    concurrency = max(1, int(concurrency))
+    chunk_days = int(chunk_days)
+    max_dates = _get_max_date_per_symbol(database_url, symbols)
+    jobs: list[tuple[str, date, date]] = []
+    for sym in symbols:
+        max_d = max_dates.get(sym)
+        s = date(2010, 1, 1) if max_d is None else max_d + timedelta(days=1)
+        if s > end:
+            continue
+        jobs.append((sym, s, end))
+
+    results: list[tuple[str, int, int, int, int]] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {
+            ex.submit(_fetch_clean_ingest_one, sym, s, e, database_url, chunk_days): sym for sym, s, e in jobs
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    out = _aggregate_ingest_results(results)
+    out["mode"] = "incremental"
+    out["end"] = str(end)
+    out["jobs_planned"] = len(jobs)
+    return out
+
+
 def main() -> None:
     _load_dotenv_if_present()
 
@@ -369,7 +495,10 @@ def main() -> None:
     _register_vnstock_user_from_env()
 
     if args.cmd == "seed":
-        seed_small_dataset()
+        stats = run_seed_small_dataset()
+        print(
+            f"Seeded: staged={stats['staged_rows']} inserted_or_updated={stats['inserted_rows']}",
+        )
         return
 
     database_url = args.database_url
@@ -390,67 +519,41 @@ def main() -> None:
 
     if args.cmd == "backfill":
         symbols = _load_symbols(args.symbols, args.symbols_file)
-        start = args.start
-        end = args.end
-    else:
+        res = run_backfill(
+            database_url,
+            symbols,
+            args.start,
+            args.end,
+            chunk_days=args.chunk_days,
+            concurrency=args.concurrency,
+            requests_per_minute=args.requests_per_minute,
+            rate_limit_burst=args.rate_limit_burst,
+        )
+    elif args.cmd == "incremental":
         symbols = _load_symbols(args.symbols, args.symbols_file)
         end = args.end if args.end is not None else _get_db_today(database_url)
-        max_dates = _get_max_date_per_symbol(database_url, symbols)
-        # Start at (max_date + 1) if present, else default to a conservative baseline.
-        start = None
-
-    concurrency = max(1, int(args.concurrency))
-    chunk_days = int(args.chunk_days)
-
-    # Configure a process-wide limiter so threads share the same budget.
-    # Community plan is 60 rpm, but default is 55 to leave headroom.
-    if args.cmd in {"backfill", "incremental"}:
-        configure_rate_limiter(requests_per_minute=max(1, int(args.requests_per_minute)), burst=max(1, int(args.rate_limit_burst)))
-
-    results: list[tuple[str, int, int, int, int]] = []
-
-    if args.cmd == "backfill":
-        with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            futures = {
-                ex.submit(_fetch_clean_ingest_one, sym, start, end, database_url, chunk_days): sym
-                for sym in symbols
-            }
-            for fut in as_completed(futures):
-                results.append(fut.result())
+        res = run_incremental(
+            database_url,
+            symbols,
+            end,
+            chunk_days=args.chunk_days,
+            concurrency=args.concurrency,
+            requests_per_minute=args.requests_per_minute,
+            rate_limit_burst=args.rate_limit_burst,
+        )
     else:
-        max_dates = _get_max_date_per_symbol(database_url, symbols)
-        jobs: list[tuple[str, date, date]] = []
-        for sym in symbols:
-            max_d = max_dates.get(sym)
-            if max_d is None:
-                # If symbol has no data yet, default to 2010 baseline.
-                s = date(2010, 1, 1)
-            else:
-                s = max_d + timedelta(days=1)
-            if s > end:
-                continue
-            jobs.append((sym, s, end))
-
-        with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            futures = {
-                ex.submit(_fetch_clean_ingest_one, sym, s, end, database_url, chunk_days): sym
-                for sym, s, end in jobs
-            }
-            for fut in as_completed(futures):
-                results.append(fut.result())
-
-    results.sort(key=lambda x: x[0])
-    total_fetched = sum(r[1] for r in results)
-    total_cleaned = sum(r[2] for r in results)
-    total_dropped = sum(r[3] for r in results)
-    total_upserted = sum(r[4] for r in results)
+        raise SystemExit(f"unexpected cmd {args.cmd!r}")
 
     print(
-        f"symbols={len(results)} fetched={total_fetched} cleaned={total_cleaned} dropped_dupes={total_dropped} "
-        f"inserted_or_updated={total_upserted}"
+        f"symbols={res['symbols_processed']} fetched={res['total_fetched']} "
+        f"cleaned={res['total_cleaned_rows']} dropped_dupes={res['total_dropped_duplicates']} "
+        f"inserted_or_updated={res['total_inserted_or_updated']}",
     )
-    for sym, fetched, cleaned_rows, dropped, upserted in results:
-        print(f"{sym}: fetched={fetched} cleaned={cleaned_rows} dropped_dupes={dropped} inserted_or_updated={upserted}")
+    for row in res["per_symbol"]:
+        print(
+            f"{row['symbol']}: fetched={row['fetched']} cleaned={row['cleaned_rows']} "
+            f"dropped_dupes={row['dropped_duplicates']} inserted_or_updated={row['inserted_or_updated']}",
+        )
 
 
 if __name__ == "__main__":
