@@ -30,8 +30,8 @@ Hệ thống **nhận diện mẫu hình** và **dự báo chứng khoán** dự
 - **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
 - **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
 - **Phase 6** ✅ DB benchmarks (HNSW vs exact, hybrid search, in-DB vs app, HNSW sweep, chunk intervals → `benchmark/results/`)
-- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
-- **Phase 8** — Xem `IMPLEMENTATION_PLAN.md`
+- **Phase 7** ✅ FastAPI REST API (OHLCV, metadata/SR, RAC, ETL jobs, benchmark, `query-embedding`)
+- **Phase 8** ✅ Streamlit dashboard (`streamlit_app/`, Plotly, gọi API — `make streamlit`)
 
 ## Chuẩn bị môi trường
 
@@ -49,7 +49,7 @@ uv sync --dev
 
 ### 0b) Makefile (tuỳ chọn — gom các CLI hay dùng)
 
-Repo có [`Makefile`](Makefile) để gom các lệnh thường dùng (`db-up`, `migrate`, ETL VN100, Phase 3/4 — windows + S/R + train/embedding, **Phase 6 benchmarks**, lint/test, API…).
+Repo có [`Makefile`](Makefile) để gom các lệnh thường dùng (`db-up`, `migrate`, ETL VN100, Phase 3/4 — windows + S/R + train/embedding, **Phase 6 benchmarks**, lint/test, **API**, **Streamlit**…).
 
 ```bash
 make help
@@ -64,6 +64,7 @@ make etl-backfill-vn100          # END mặc định = ngày hôm nay (theo `uv 
 make etl-backfill-vn100 END=2026-04-19
 make etl-incremental-vn100 END=2026-04-19
 make api
+make streamlit                    # Phase 8 — cần API (mặc định http://127.0.0.1:8000)
 ```
 
 ### Makefile — thứ tự gợi ý trên DB thật (Phase 2 → 3 → 4, VN100)
@@ -360,6 +361,8 @@ Xem thêm [`benchmark/README.md`](benchmark/README.md).
 ### Chạy server
 
 ```bash
+make api
+# hoặc:
 uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -381,6 +384,32 @@ Mở docs:
 - `POST /api/rac/full-context`
 - `POST /api/rac/predict?persist=true|false`
 - `GET /api/rac/predictions/{symbol}?limit=...`
+- `POST /api/etl/seed` — nạp fixture (background job → `GET /api/etl/status/{job_id}`)
+- `POST /api/etl/backfill` — body: `symbols`, `start`, `end`, …
+- `POST /api/etl/incremental` — body: `symbols`, optional `end`
+- `GET /api/etl/status/{job_id}`
+- `POST /api/rac/query-embedding` — `symbol` + `window_end` → embedding 128 + OHLCV 30 phiên (cần file encoder: `ml/model_store/cnn_encoder.pt` hoặc env `CNN_ENCODER_PATH`)
+- `POST /api/benchmark/explain` — `query_kind`: `hnsw_knn` | `seqscan_knn` | `hybrid_context`
+- `GET /api/benchmark/stats` — tóm tắt `pg_stat_statements` (nếu extension có)
+- `GET /api/benchmark/results` — danh sách file JSON trong `benchmark/results/`
+- `GET /api/benchmark/results/{name}`
+
+---
+
+## Chạy Phase 8 (Streamlit)
+
+> Giao diện chỉ gọi **FastAPI**, không kết nối PostgreSQL trực tiếp. Cần encoder đã train cho trang **Similar patterns** / **RAC** (`POST /api/rac/query-embedding`).
+
+1. Chạy API (terminal 1): `make api` hoặc `uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000`
+2. Chạy dashboard (terminal 2):
+
+```bash
+make streamlit
+```
+
+Tuỳ chọn Makefile: `ST_PORT=8501` `ST_HOST=127.0.0.1` `ST_APP=streamlit_app/app.py`.
+
+Trong sidebar từng trang có thể đổi **API base URL** (mặc định `http://127.0.0.1:8000`). Biến môi trường tương đương: `API_BASE_URL`.
 
 ---
 
@@ -414,8 +443,8 @@ This repo implements an **equity pattern recognition** and **stock forecasting**
 - **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
 - **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
 - **Phase 6** ✅ Database benchmarks (HNSW vs exact, hybrid search, in-DB vs app, HNSW sweep, chunk intervals → `benchmark/results/`)
-- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
-- **Phase 8** — See `IMPLEMENTATION_PLAN.md`
+- **Phase 7** ✅ FastAPI REST API (OHLCV, metadata/SR, RAC, ETL jobs, benchmark, `query-embedding`)
+- **Phase 8** ✅ Streamlit dashboard (`streamlit_app/`, Plotly, API-backed — `make streamlit`)
 
 ## Environment Setup
 
@@ -434,7 +463,7 @@ uv sync --dev
 
 ### 0b) Makefile (optional — common CLI shortcuts)
 
-This repo includes a [`Makefile`](Makefile) that wraps frequent commands (`db-up`, `migrate`, VN100 ETL, Phase 3/4 windows + S/R + train/embeddings, **Phase 6 benchmarks**, lint/tests, API, …).
+This repo includes a [`Makefile`](Makefile) that wraps frequent commands (`db-up`, `migrate`, VN100 ETL, Phase 3/4 windows + S/R + train/embeddings, **Phase 6 benchmarks**, lint/tests, **API**, **Streamlit**, …).
 
 ```bash
 make help
@@ -449,6 +478,7 @@ make etl-backfill-vn100          # END defaults to "today" (via `uv run python`)
 make etl-backfill-vn100 END=2026-04-19
 make etl-incremental-vn100 END=2026-04-19
 make api
+make streamlit                    # Phase 8 — requires API (default http://127.0.0.1:8000)
 ```
 
 ### Makefile — suggested order on a real DB (Phase 2 → 4, VN100)
@@ -701,6 +731,8 @@ See also [`benchmark/README.md`](benchmark/README.md).
 ### Start the server
 
 ```bash
+make api
+# or:
 uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -722,3 +754,19 @@ Open docs:
 - `POST /api/rac/full-context`
 - `POST /api/rac/predict?persist=true|false`
 - `GET /api/rac/predictions/{symbol}?limit=...`
+- `POST /api/etl/seed` — load fixture (async job → `GET /api/etl/status/{job_id}`)
+- `POST /api/etl/backfill`, `POST /api/etl/incremental`, `GET /api/etl/status/{job_id}`
+- `POST /api/rac/query-embedding` — `symbol` + `window_end` → 128-d embedding + 30 OHLCV bars (weights: `ml/model_store/cnn_encoder.pt` or `CNN_ENCODER_PATH`)
+- `POST /api/benchmark/explain` — whitelisted `query_kind`: `hnsw_knn`, `seqscan_knn`, `hybrid_context`
+- `GET /api/benchmark/stats`, `GET /api/benchmark/results`, `GET /api/benchmark/results/{name}`
+
+---
+
+## Run Phase 8 (Streamlit)
+
+> The UI talks to **FastAPI only** (no direct Postgres). Train an encoder first for **Similar patterns** / **RAC** (`POST /api/rac/query-embedding`).
+
+1. Start the API (terminal 1): `make api` or `uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000`
+2. Start the dashboard (terminal 2): `make streamlit`
+
+Makefile overrides: `ST_PORT`, `ST_HOST`, `ST_APP`. Sidebar **API base URL** per page (default `http://127.0.0.1:8000`); env: `API_BASE_URL`.
