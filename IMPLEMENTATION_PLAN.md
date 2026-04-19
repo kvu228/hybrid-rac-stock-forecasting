@@ -1,6 +1,6 @@
 # Implementation Plan: Hybrid-RAC-Stock
 
-> Cập nhật: 2026-04-17
+> Cập nhật: 2026-04-19
 
 ---
 
@@ -60,17 +60,17 @@
 - [x] 4.1 **1D-CNN Encoder** (`ml/cnn_encoder.py`)
     - [x] Kiến trúc: Input [batch × 30 × 5] → Conv1D layers → Output vector(128)
     - [x] Framework: PyTorch
-    - [ ] Loss function: Triplet loss hoặc contrastive loss (để embedding gần nhau khi pattern giống) — pending (tối ưu chất lượng embedding)
+    - [x] Loss function: **Triplet** (`--loss triplet`, `TripletMarginLoss` trên embedding); contrastive tùy chọn mở rộng sau
 - [x] 4.2 **Training Pipeline** (`ml/train_pipeline.py`)
     - [x] Tối thiểu: smoke-train để tạo encoder weights (phục vụ sinh embeddings cho DB)
-    - [ ] Train/evaluate theo train/test split Phase 3 — pending (nâng chất lượng ML, không phải trọng tâm DB)
+    - [x] Train/evaluate theo train/test split Phase 3 (`test_accuracy` với CE; `--metrics-out` ghi JSON)
 - [x] 4.3 **Embedding Generator** (`ml/embedding_generator.py`)
     - [x] Load trained CNN → encode windows → vector(128)
     - [x] Batch INSERT vào `pattern_embeddings` (kèm label + future_return)
-    - [ ] Verify HNSW index rebuilt / updated sau insert — pending (benchmark/monitoring)
+    - [x] Sau insert: `verify_hnsw_index_used()` (EXPLAIN KNN mẫu) → field `hnsw_index_used` trong `InsertStats`
 - [x] 4.4 **SVM Classifier** (`ml/svm_classifier.py`)
     - [x] Framework: scikit-learn (wrapper train/load/predict)
-    - [ ] Train trên tập train, evaluate trên tập test — pending
+    - [x] Train/eval trên split thời gian: CLI `python -m ml.svm_eval` (embedding CNN + `classification_report`)
 - [x] 4.5 **Dependencies**
     - [x] `uv add torch scikit-learn numpy pandas`
 
@@ -120,7 +120,7 @@
 
 ---
 
-## Phase 7: FastAPI REST API
+## Phase 7: FastAPI REST API ✅
 
 > **Mục tiêu:** HTTP API thay thế CLI, phục vụ làm backend cho Streamlit dashboard.
 
@@ -129,16 +129,17 @@
     - [x] CORS middleware
     - [x] `api/deps.py` — shared dependency `get_db_conn`
     - [x] `api/schemas.py` — Pydantic request/response models
-- [ ] 7.2 **ETL Router** (`api/routers/etl.py`)
-    - [ ] `POST /api/etl/seed` — load fixture
-    - [ ] `POST /api/etl/backfill` — background task, trả job_id
-    - [ ] `POST /api/etl/incremental` — background task
-    - [ ] `GET /api/etl/status/{job_id}` — poll trạng thái
+- [x] 7.2 **ETL Router** (`api/routers/etl.py`)
+    - [x] `POST /api/etl/seed` — load fixture
+    - [x] `POST /api/etl/backfill` — background task, trả job_id
+    - [x] `POST /api/etl/incremental` — background task
+    - [x] `GET /api/etl/status/{job_id}` — poll trạng thái
 - [x] 7.3 **OHLCV Router** (`api/routers/ohlcv.py`)
     - [x] `GET /api/symbols` — danh sách symbols trong DB
     - [x] `GET /api/ohlcv/{symbol}?start=...&end=...` — OHLCV theo time range
     - [x] `GET /api/ohlcv/{symbol}/latest?n=30` — N phiên gần nhất
 - [x] 7.4 **RAC Router** (`api/routers/rac.py`)
+    - [x] `POST /api/rac/query-embedding` — cửa sổ OHLCV 30 phiên → embedding (phục vụ Streamlit)
     - [x] `POST /api/rac/similar-patterns` — gọi `find_similar_patterns()`
     - [x] `POST /api/rac/context` — gọi `compute_rac_context()`
     - [x] `POST /api/rac/full-context` — gọi `compute_full_rac_context()` (★ Hybrid Query)
@@ -147,43 +148,43 @@
 - [x] 7.5 **Metadata Router** (`api/routers/metadata.py`)
     - [x] `GET /api/sr-zones/{symbol}` — S/R zones active
     - [x] `GET /api/sr-zones/{symbol}/distance?price=...` — gọi `get_distance_to_nearest_sr()`
-- [ ] 7.6 **Benchmark Router** (`api/routers/benchmark.py`)
-    - [ ] `POST /api/benchmark/explain` — chạy `EXPLAIN ANALYZE`
-    - [ ] `GET /api/benchmark/stats` — `pg_stat_statements` summary
+- [x] 7.6 **Benchmark Router** (`api/routers/benchmark.py`)
+    - [x] `POST /api/benchmark/explain` — `EXPLAIN (ANALYZE, BUFFERS)` (SQL whitelist: `hnsw_knn`, `seqscan_knn`, `hybrid_context`)
+    - [x] `GET /api/benchmark/stats` — `pg_stat_statements` (graceful nếu extension chưa bật)
+    - [x] `GET /api/benchmark/results` + `GET /api/benchmark/results/{name}` — đọc JSON trong `benchmark/results/` (phục vụ Streamlit)
 - [x] 7.7 **Dependencies**: `uv add uvicorn psycopg-pool`
 - [x] 7.8 **Tests**: API integration tests với `httpx.AsyncClient`
 
 ---
 
-## Phase 8: Streamlit Dashboard
+## Phase 8: Streamlit Dashboard ✅
 
 > **Mục tiêu:** Visualization cho demo bảo vệ đề tài. Gọi FastAPI, KHÔNG kết nối DB trực tiếp.
 
-- [ ] 8.1 **App entry** (`streamlit_app/app.py`) — multi-page layout
-- [ ] 8.2 **Trang 1: OHLCV Explorer** (`pages/1_ohlcv_chart.py`)
-    - [ ] Dropdown symbol + date range picker
-    - [ ] Plotly Candlestick + Volume bars
-    - [ ] S/R zones overlay (horizontal lines)
-- [ ] 8.3 **Trang 2: Similar Patterns** (`pages/2_similar_patterns.py`) ★ Highlight
-    - [ ] Chọn query window (symbol + date range)
-    - [ ] Grid hiển thị K neighbors: mini candlestick charts
-    - [ ] Normalized overlay chart (so sánh hình dáng cùng scale [0,1])
-    - [ ] Bảng: cosine_distance, label, future_return
-    - [ ] Pie chart: label distribution + confidence metric
-- [ ] 8.4 **Trang 3: RAC Prediction** (`pages/3_rac_prediction.py`)
-    - [ ] Hiển thị 3 blocks từ `compute_full_rac_context()`:
+- [x] 8.1 **App entry** (`streamlit_app/app.py`) — multipage + sidebar URL API
+- [x] 8.2 **Trang 1: OHLCV Explorer** (`pages/1_ohlcv_chart.py`)
+    - [x] Dropdown symbol + date range picker
+    - [x] Plotly Candlestick + Volume bars
+    - [x] S/R zones overlay (horizontal lines)
+- [x] 8.3 **Trang 2: Similar Patterns** (`pages/2_similar_patterns.py`) ★ Highlight
+    - [x] Chọn query window (symbol + session slider)
+    - [x] Grid hiển thị K neighbors: mini candlestick charts
+    - [x] Normalized overlay chart (so sánh hình dáng cùng scale [0,1])
+    - [x] Bảng: cosine_distance, label, future_return
+    - [x] Pie chart: label distribution (neighbors)
+- [x] 8.4 **Trang 3: RAC Prediction** (`pages/3_rac_prediction.py`)
+    - [x] Hiển thị 3 blocks từ `compute_full_rac_context()`:
         - Block 1 — KNN Stats: metric cards + pie chart
         - Block 2 — S/R Context: gauge chart (sr_position_ratio)
-        - Block 3 — Evidence: neighbor IDs + link sang trang 2
-- [ ] 8.5 **Trang 4: Benchmark** (`pages/4_benchmark.py`)
-    - [ ] Bar chart: HNSW vs SeqScan latency
-    - [ ] Bar chart: In-DB vs App-side
-    - [ ] Heatmap: HNSW param sweep → Recall@K
-    - [ ] Query plan viewer (`EXPLAIN ANALYZE` output)
-- [ ] 8.6 **Shared components**
-    - [ ] `components/candlestick.py` — Plotly candlestick helper
-    - [ ] `components/similarity.py` — Normalized overlay helper
-- [ ] 8.7 **Dependencies**: `uv add --dev streamlit plotly httpx`
+        - Block 3 — Evidence: neighbor IDs (+ caption trang Similar patterns)
+- [x] 8.5 **Trang 4: Benchmark** (`pages/4_benchmark.py`)
+    - [x] Bar chart từ JSON benchmark (HNSW vs exact p50/p95/p99 khi có trong file)
+    - [x] `pg_stat_statements` + danh sách artifact JSON qua API
+    - [x] Query plan viewer (`POST /api/benchmark/explain`)
+- [x] 8.6 **Shared components**
+    - [x] `components/candlestick.py` — Plotly candlestick helper
+    - [x] `components/similarity.py` — Normalized overlay helper
+- [x] 8.7 **Dependencies**: `uv sync --dev` (streamlit, plotly; httpx đã có trong dev)
 
 ---
 
