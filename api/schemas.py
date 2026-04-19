@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # --- OHLCV ---
@@ -51,6 +51,33 @@ class SRDistanceResult(BaseModel):
     current_price: float
     dist_to_support: float | None
     dist_to_resistance: float | None
+
+
+class PurgeInactiveSRRequest(BaseModel):
+    """Delete historical S/R rows left after ``detect-sr`` (``is_active=FALSE``)."""
+
+    all_inactive: bool = Field(
+        default=False,
+        description="If true, delete inactive rows for every symbol (omit ``symbols``).",
+    )
+    symbols: list[str] | None = Field(
+        default=None,
+        description="If set (non-empty), delete inactive rows only for these symbols.",
+    )
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> "PurgeInactiveSRRequest":
+        if self.all_inactive:
+            if self.symbols:
+                raise ValueError("omit symbols when all_inactive is true")
+            return self
+        if not self.symbols:
+            raise ValueError("provide a non-empty symbols list or set all_inactive to true")
+        return self
+
+
+class PurgeInactiveSRResponse(BaseModel):
+    deleted_count: int
 
 
 # --- RAC ---

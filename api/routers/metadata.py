@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from api.deps import DbConn
-from api.schemas import SRDistanceResult, SRZoneRow
+from api.schemas import PurgeInactiveSRRequest, PurgeInactiveSRResponse, SRDistanceResult, SRZoneRow
 
 router = APIRouter()
 
@@ -74,3 +74,24 @@ async def get_sr_distance(
         "dist_to_support": dist_support,
         "dist_to_resistance": dist_resistance,
     }
+
+
+@router.post("/sr-zones/purge-inactive", response_model=PurgeInactiveSRResponse)
+async def purge_inactive_sr_zones(conn: DbConn, req: PurgeInactiveSRRequest) -> dict[str, int]:
+    """DELETE ``support_resistance_zones`` rows where ``is_active`` is FALSE.
+
+    ``detect-sr`` deactivates prior zones and inserts new ones; inactive rows
+    otherwise stay in the table. Use this for periodic maintenance.
+
+    Restrict in production (auth / internal-only), like any destructive admin API.
+    """
+    if req.all_inactive:
+        cur = await conn.execute("DELETE FROM support_resistance_zones WHERE is_active = FALSE", {})
+    else:
+        cur = await conn.execute(
+            "DELETE FROM support_resistance_zones WHERE is_active = FALSE AND symbol = ANY(%(symbols)s)",
+            {"symbols": req.symbols},
+        )
+    rc = cur.rowcount
+    deleted = int(rc) if rc is not None and rc >= 0 else 0
+    return {"deleted_count": deleted}

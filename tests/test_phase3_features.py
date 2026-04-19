@@ -15,7 +15,13 @@ from etl.feature_engineer import (
     train_test_split_by_time,
     zscore_normalize_window,
 )
-from etl.sr_detector import SRZone, detect_pivot_points, detect_sr_zones, ingest_sr_zones
+from etl.sr_detector import (
+    SRZone,
+    detect_pivot_points,
+    detect_sr_zones,
+    ingest_sr_zones,
+    purge_inactive_sr_zones,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -254,3 +260,38 @@ def test_ingest_sr_zones_roundtrip() -> None:
             sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"),
             {"sym": symbol},
         )
+
+
+def test_purge_inactive_sr_zones() -> None:
+    """Inactive S/R rows are removed; active rows for the same symbol remain."""
+    db_url = _database_url()
+    symbol = "__TEST_PURGE_SR__"
+
+    with _engine().begin() as conn:
+        conn.execute(sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"), {"sym": symbol})
+        conn.execute(
+            sa.text(
+                "INSERT INTO support_resistance_zones (symbol, zone_type, price_level, strength, is_active) VALUES "
+                "(:sym, 'SUPPORT', 1.0, 1.0, FALSE), (:sym, 'SUPPORT', 2.0, 1.0, FALSE), "
+                "(:sym, 'RESISTANCE', 3.0, 1.0, TRUE)"
+            ),
+            {"sym": symbol},
+        )
+
+    deleted = purge_inactive_sr_zones(db_url, symbols=[symbol])
+    assert deleted == 2
+
+    with _engine().connect() as conn:
+        total = conn.execute(
+            sa.text("SELECT COUNT(*) FROM support_resistance_zones WHERE symbol = :sym"),
+            {"sym": symbol},
+        ).scalar_one()
+        assert int(total) == 1
+        inactive = conn.execute(
+            sa.text("SELECT COUNT(*) FROM support_resistance_zones WHERE symbol = :sym AND is_active = FALSE"),
+            {"sym": symbol},
+        ).scalar_one()
+        assert int(inactive) == 0
+
+    with _engine().begin() as conn:
+        conn.execute(sa.text("DELETE FROM support_resistance_zones WHERE symbol = :sym"), {"sym": symbol})

@@ -262,6 +262,17 @@ def _cmd_detect_sr(args: argparse.Namespace, database_url: str) -> None:
     print(f"symbols={len(symbols)} zones={len(zones)} support={support_count} resistance={resist_count} inserted={inserted}")
 
 
+def _cmd_purge_inactive_sr(args: argparse.Namespace, database_url: str) -> None:
+    from etl.sr_detector import purge_inactive_sr_zones
+
+    if args.all_inactive:
+        n = purge_inactive_sr_zones(database_url, symbols=None)
+    else:
+        syms = _load_symbols(args.symbols, args.symbols_file)
+        n = purge_inactive_sr_zones(database_url, symbols=syms)
+    print(f"purge-inactive-sr deleted_rows={n}")
+
+
 def main() -> None:
     _load_dotenv_if_present()
 
@@ -338,6 +349,20 @@ def main() -> None:
     p_sr.add_argument("--order", type=int, default=5, help="Pivot half-window size (default: 5)")
     p_sr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
+    p_purge = sub.add_parser(
+        "purge-inactive-sr",
+        help="DELETE support_resistance_zones rows where is_active=FALSE",
+    )
+    p_purge_mx = p_purge.add_mutually_exclusive_group(required=True)
+    p_purge_mx.add_argument(
+        "--all-inactive",
+        action="store_true",
+        help="Delete every inactive row (all symbols)",
+    )
+    p_purge_mx.add_argument("--symbols", nargs="+", help="Ticker symbols")
+    p_purge_mx.add_argument("--symbols-file", help="Text file with one symbol per line")
+    p_purge.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
+
     args = parser.parse_args()
 
     # If VNSTOCK_API_KEY is set, register once to raise rate limits.
@@ -357,6 +382,10 @@ def main() -> None:
 
     if args.cmd == "detect-sr":
         _cmd_detect_sr(args, database_url)
+        return
+
+    if args.cmd == "purge-inactive-sr":
+        _cmd_purge_inactive_sr(args, database_url)
         return
 
     if args.cmd == "backfill":
