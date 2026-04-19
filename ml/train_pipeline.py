@@ -7,6 +7,7 @@ exists to produce embeddings with enough structure for retrieval experiments.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from datetime import date
@@ -35,6 +36,8 @@ class TrainConfig:
     seed: int = 42
     train_ratio: float = 0.8
     num_workers: int = 0
+    loss: str = "ce"  # "ce" | "triplet"
+    triplet_margin: float = 0.2
 
 
 class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -105,42 +108,14 @@ def _records_to_arrays(records: Sequence[WindowRecord]) -> tuple[np.ndarray, np.
     return windows, labels
 
 
-def train_from_ohlcv(
-    df: pd.DataFrame,
-    *,
-    encoder_cfg: EncoderConfig = EncoderConfig(),
-    train_cfg: TrainConfig = TrainConfig(),
-) -> tuple[CNNEncoder, dict[str, float]]:
-    """Train encoder using a simple classification head (labels from Phase 3)."""
-    _set_seed(train_cfg.seed)
-
-    records = generate_windows(df)
-    train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
-    if not train_recs:
-        raise ValueError("No training windows generated; check OHLCV input range/quality.")
-
-    x_train, y_train = _records_to_arrays(train_recs)
-    x_test, y_test = _records_to_arrays(test_recs) if test_recs else (np.zeros((0, 30, 5)), np.zeros((0,)))
-
-    train_ds = WindowDataset(x_train, y_train)
-    test_ds = WindowDataset(x_test, y_test) if len(x_test) else None
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        shuffle=True,
-        num_workers=train_cfg.num_workers,
-    )
-    test_loader = (
-        DataLoader(test_ds, batch_size=train_cfg.batch_size, shuffle=False, num_workers=train_cfg.num_workers)
-        if test_ds is not None
-        else None
-    )
-
-    encoder = CNNEncoder(encoder_cfg)
+def _train_encoder_ce(
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    encoder: CNNEncoder,
+    train_cfg: TrainConfig,
+) -> tuple[CNNEncoder, float, float]:
     model = EncoderWithHead(encoder)
     model.to(train_cfg.device)
-
     loss_fn = nn.CrossEntropyLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
 
@@ -173,11 +148,109 @@ def train_from_ohlcv(
             opt.step()
             last_loss = float(loss.item())
 
+    acc = float(eval_acc())
+    return model.encoder, last_loss, acc
+
+
+def _train_encoder_triplet(
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    encoder: CNNEncoder,
+    train_cfg: TrainConfig,
+) -> tuple[CNNEncoder, float]:
+    device = train_cfg.device
+    encoder = encoder.to(device)
+    loss_fn = nn.TripletMarginLoss(margin=float(train_cfg.triplet_margin), p=2)
+    opt = torch.optim.AdamW(encoder.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+
+    last_loss = 0.0
+    for _epoch in range(train_cfg.epochs):
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            b = int(xb.size(0))
+            if b < 2:
+                continue
+            anchors: list[torch.Tensor] = []
+            positives: list[torch.Tensor] = []
+            negatives: list[torch.Tensor] = []
+            for i in range(b):
+                same_idx = ((yb == yb[i]) & (torch.arange(b, device=yb.device) != i)).nonzero(as_tuple=False).view(-1)
+                diff_idx = (yb != yb[i]).nonzero(as_tuple=False).view(-1)
+                if same_idx.numel() == 0 or diff_idx.numel() == 0:
+                    continue
+                j = int(same_idx[torch.randint(same_idx.numel(), (1,), device=device)].item())
+                k = int(diff_idx[torch.randint(diff_idx.numel(), (1,), device=device)].item())
+                anchors.append(xb[i])
+                positives.append(xb[j])
+                negatives.append(xb[k])
+            if len(anchors) < 2:
+                continue
+            a = torch.stack(anchors)
+            p = torch.stack(positives)
+            n = torch.stack(negatives)
+            opt.zero_grad(set_to_none=True)
+            loss = loss_fn(encoder(a), encoder(p), encoder(n))
+            loss.backward()
+            opt.step()
+            last_loss = float(loss.item())
+
+    return encoder, last_loss
+
+
+def train_from_ohlcv(
+    df: pd.DataFrame,
+    *,
+    encoder_cfg: EncoderConfig = EncoderConfig(),
+    train_cfg: TrainConfig = TrainConfig(),
+) -> tuple[CNNEncoder, dict[str, float]]:
+    """Train encoder with CE+linear head (default) or triplet loss on embeddings."""
+    _set_seed(train_cfg.seed)
+    if train_cfg.loss not in {"ce", "triplet"}:
+        raise ValueError("train_cfg.loss must be 'ce' or 'triplet'")
+
+    records = generate_windows(df)
+    train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
+    if not train_recs:
+        raise ValueError("No training windows generated; check OHLCV input range/quality.")
+
+    x_train, y_train = _records_to_arrays(train_recs)
+    x_test, y_test = _records_to_arrays(test_recs) if test_recs else (np.zeros((0, 30, 5)), np.zeros((0,)))
+
+    train_ds = WindowDataset(x_train, y_train)
+    test_ds = WindowDataset(x_test, y_test) if len(x_test) else None
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=train_cfg.batch_size,
+        shuffle=True,
+        num_workers=train_cfg.num_workers,
+    )
+    test_loader = (
+        DataLoader(test_ds, batch_size=train_cfg.batch_size, shuffle=False, num_workers=train_cfg.num_workers)
+        if test_ds is not None
+        else None
+    )
+
+    encoder = CNNEncoder(encoder_cfg)
+
+    if train_cfg.loss == "triplet":
+        encoder, last_loss = _train_encoder_triplet(train_loader, encoder, train_cfg)
+        metrics = {
+            "train_windows": float(len(train_ds)),
+            "test_windows": float(len(test_ds)) if test_ds is not None else 0.0,
+            "last_train_loss": float(last_loss),
+            "test_accuracy": float("nan"),
+            "loss_mode": "triplet",
+        }
+        return encoder, metrics
+
+    encoder, last_loss, acc = _train_encoder_ce(train_loader, test_loader, encoder, train_cfg)
     metrics = {
         "train_windows": float(len(train_ds)),
         "test_windows": float(len(test_ds)) if test_ds is not None else 0.0,
         "last_train_loss": float(last_loss),
-        "test_accuracy": float(eval_acc()),
+        "test_accuracy": acc,
+        "loss_mode": "ce",
     }
     return encoder, metrics
 
@@ -219,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--device", type=str, default=os.environ.get("TORCH_DEVICE", "cpu"))
+    parser.add_argument("--loss", choices=("ce", "triplet"), default="ce", help="Training objective for the encoder.")
+    parser.add_argument("--triplet-margin", type=float, default=0.2, help="Triplet margin (triplet loss only).")
+    parser.add_argument("--metrics-out", type=Path, default=None, help="Optional path to write metrics JSON.")
     args = parser.parse_args(argv)
 
     load_dotenv(override=False)
@@ -254,11 +330,20 @@ def main(argv: list[str] | None = None) -> int:
         df = _load_ohlcv_tsv(args.ohlcv_tsv)
     encoder, metrics = train_from_ohlcv(
         df,
-        train_cfg=TrainConfig(epochs=args.epochs, batch_size=args.batch_size, device=args.device),
+        train_cfg=TrainConfig(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            device=args.device,
+            loss=str(args.loss),
+            triplet_margin=float(args.triplet_margin),
+        ),
     )
     save_encoder(encoder, args.out)
     print(f"Saved encoder to {args.out}")
     print(metrics)
+    if args.metrics_out is not None:
+        args.metrics_out.parent.mkdir(parents=True, exist_ok=True)
+        args.metrics_out.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return 0
 
 

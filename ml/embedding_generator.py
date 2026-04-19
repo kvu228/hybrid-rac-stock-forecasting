@@ -26,6 +26,7 @@ from ml.cnn_encoder import CNNEncoder, EncoderConfig, encode_batch
 class InsertStats:
     windows: int
     inserted: int
+    hnsw_index_used: bool | None = None
 
 
 def _database_url() -> str:
@@ -82,6 +83,24 @@ def fetch_ohlcv(
     if not df.empty:
         df["time"] = pd.to_datetime(df["time"], utc=True)
     return df
+
+
+def verify_hnsw_index_used(conn: psycopg.Connection[tuple[object, ...]], *, k: int = 10) -> bool | None:
+    """Return whether EXPLAIN for a sample KNN plan references the HNSW index (or None if no rows)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT embedding::text FROM pattern_embeddings ORDER BY id LIMIT 1")
+        row = cur.fetchone()
+        if row is None:
+            return None
+        qv = str(row[0])
+        cur.execute(
+            "EXPLAIN (FORMAT TEXT) SELECT id FROM pattern_embeddings "
+            "ORDER BY embedding <=> %s::vector LIMIT %s",
+            (qv, k),
+        )
+        plan = "\n".join(str(r[0]) for r in cur.fetchall())
+    low = plan.lower()
+    return ("hnsw" in low) or ("idx_embedding_hnsw" in low)
 
 
 def insert_embeddings(
@@ -143,7 +162,10 @@ def generate_and_insert(
         windows = np.stack([r.data for r in records], axis=0) if records else np.zeros((0, 30, 5), np.float32)
         embeddings = encode_batch(model, windows, device=device, batch_size=batch_size) if len(records) else np.zeros((0, 128), np.float32)
         inserted = insert_embeddings(conn, records=records, embeddings=embeddings) if len(records) else 0
-        return InsertStats(windows=len(records), inserted=inserted)
+        hnsw: bool | None = None
+        if inserted > 0:
+            hnsw = verify_hnsw_index_used(conn, k=10)
+        return InsertStats(windows=len(records), inserted=inserted, hnsw_index_used=hnsw)
 
 
 def main(argv: list[str] | None = None) -> int:
