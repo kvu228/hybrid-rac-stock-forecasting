@@ -127,6 +127,13 @@ class RacFullContextRequest(BaseModel):
     k: int = Field(default=20, ge=1, le=200)
 
 
+class NeighborLabelDistanceRow(BaseModel):
+    """One KNN row: class label + cosine distance to the query embedding."""
+
+    label: int | None = None
+    cosine_distance: float
+
+
 class RacFullContextResponse(BaseModel):
     total_neighbors: int
     avg_cosine_dist: float | None
@@ -139,6 +146,7 @@ class RacFullContextResponse(BaseModel):
     dist_to_resistance: float | None
     sr_position_ratio: float | None
     neighbor_ids: list[int]
+    neighbor_label_distances: list[NeighborLabelDistanceRow] = Field(default_factory=list)
 
 
 class RacPredictionRow(BaseModel):

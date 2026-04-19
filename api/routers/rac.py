@@ -30,7 +30,7 @@ from api.schemas import (
     RacSimilarPatternsRequest,
     RacSimilarPatternsResponse,
 )
-from rac.context_enricher import compute_full_rac_context, compute_rac_context
+from rac.context_enricher import FullRacContext, compute_full_rac_context, compute_rac_context
 from rac.query_window import (
     build_normalized_query_window,
     embedding_from_normalized_window,
@@ -40,6 +40,26 @@ from rac.rac_classifier import predict_and_persist
 from rac.retriever import find_similar_patterns
 
 router = APIRouter()
+
+
+def _full_context_api_dict(ctx: FullRacContext) -> dict[str, object]:
+    """JSON-friendly ``FullRacContext`` (neighbor_label_distances as dict rows)."""
+    return {
+        "total_neighbors": ctx.total_neighbors,
+        "avg_cosine_dist": ctx.avg_cosine_dist,
+        "label_distribution": ctx.label_distribution,
+        "avg_future_return": ctx.avg_future_return,
+        "stddev_future_return": ctx.stddev_future_return,
+        "dominant_label": ctx.dominant_label,
+        "knn_confidence": ctx.knn_confidence,
+        "dist_to_support": ctx.dist_to_support,
+        "dist_to_resistance": ctx.dist_to_resistance,
+        "sr_position_ratio": ctx.sr_position_ratio,
+        "neighbor_ids": ctx.neighbor_ids,
+        "neighbor_label_distances": [
+            {"label": lab, "cosine_distance": d} for lab, d in ctx.neighbor_label_distances
+        ],
+    }
 
 
 @router.post("/rac/query-embedding", response_model=RacQueryEmbeddingResponse)
@@ -150,19 +170,7 @@ async def rac_full_context(conn: DbConn, req: RacFullContextRequest) -> dict[str
         current_price=req.current_price,
         k=req.k,
     )
-    return {
-        "total_neighbors": ctx.total_neighbors,
-        "avg_cosine_dist": ctx.avg_cosine_dist,
-        "label_distribution": ctx.label_distribution,
-        "avg_future_return": ctx.avg_future_return,
-        "stddev_future_return": ctx.stddev_future_return,
-        "dominant_label": ctx.dominant_label,
-        "knn_confidence": ctx.knn_confidence,
-        "dist_to_support": ctx.dist_to_support,
-        "dist_to_resistance": ctx.dist_to_resistance,
-        "sr_position_ratio": ctx.sr_position_ratio,
-        "neighbor_ids": ctx.neighbor_ids,
-    }
+    return _full_context_api_dict(ctx)
 
 
 @router.post("/rac/predict", response_model=dict[str, object])
@@ -182,7 +190,7 @@ async def rac_predict(
         )
         pred_label = int(ctx.dominant_label) if ctx.dominant_label is not None else 1
         conf = float(ctx.knn_confidence) if ctx.knn_confidence is not None else None
-        return {"predicted_label": pred_label, "confidence_score": conf, "context": ctx.__dict__}
+        return {"predicted_label": pred_label, "confidence_score": conf, "context": _full_context_api_dict(ctx)}
 
     res = await predict_and_persist(
         conn,
@@ -198,7 +206,7 @@ async def rac_predict(
         "avg_neighbor_dist": res.avg_neighbor_dist,
         "neighbor_label_dist": res.neighbor_label_dist,
         "neighbor_ids": res.neighbor_ids,
-        "context": res.context.__dict__,
+        "context": _full_context_api_dict(res.context),
     }
 
 
