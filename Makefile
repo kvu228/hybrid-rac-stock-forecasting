@@ -36,6 +36,12 @@ ML_ENCODER_BATCH ?= 256
 ML_DEVICE ?= cpu
 ML_EMBED_BATCH ?= 512
 
+# Phase 6: DB benchmarks (require DATABASE_URL; HNSW scripts DROP/CREATE idx_embedding_hnsw)
+BENCH_K ?= 20
+BENCH_N_QUERIES ?= 30
+BENCH_SEED ?= 42
+BENCH_EF_SEARCH ?= 100
+
 .PHONY: help
 help:
 	@echo "Makefile shortcuts for common CLI workflows."
@@ -76,6 +82,17 @@ help:
 	@echo "  make ml-embed-symbol SYMBOL=VCB - embed one symbol (truncate + insert)"
 	@echo "  make ml-embed-vn100         - loop all tickers in TICKERS_VN100 (sequential)"
 	@echo ""
+	@echo "Phase 6 (DB benchmarks — dev DB only for HNSW DROP/CREATE; see benchmark/README.md):"
+	@echo "  make bench-smoke            - pytest tests/test_benchmark_smoke.py"
+	@echo "  make bench-hnsw-vs-seqscan  - HNSW vs exact KNN + EXPLAIN (vars: BENCH_K, BENCH_N_QUERIES, ...)"
+	@echo "  make bench-hnsw-vs-seqscan-dry - print one EXPLAIN only (no index drop)"
+	@echo "  make bench-hybrid           - global KNN vs symbol-filtered KNN"
+	@echo "  make bench-indb-appside   - compute_rac_context vs app-side aggregation"
+	@echo "  make bench-hnsw-sweep-quick - small HNSW param grid"
+	@echo "  make bench-hnsw-sweep     - full HNSW grid (slow)"
+	@echo "  make bench-chunk            - Timescale chunk interval bench tables + range EXPLAIN"
+	@echo "  make bench-chunk-teardown   - DROP bench_stock_ohlcv_* hypertables"
+	@echo ""
 	@echo "Examples:"
 	@echo "  make etl-backfill-vn100 END=2026-04-19"
 	@echo "  make etl-incremental-vn100 END=2026-04-19 CONCURRENCY=2 RPM=55"
@@ -83,6 +100,7 @@ help:
 	@echo "  make ml-train-encoder ML_ENCODER_EPOCHS=12 OHLCV_TSV=path/to/export.tsv"
 	@echo "  make ml-train-encoder-db WIN_START=2015-01-01 WIN_END=2025-12-31"
 	@echo "  make ml-embed-vn100 ML_EMBED_BATCH=256"
+	@echo "  make bench-hnsw-vs-seqscan BENCH_K=20 BENCH_N_QUERIES=50 BENCH_SEED=1"
 
 .PHONY: sync
 sync:
@@ -263,3 +281,51 @@ _require-symbol:
 ifeq ($(strip $(SYMBOL)),)
 	$(error SYMBOL is required (example: make ml-embed-symbol SYMBOL=VCB))
 endif
+
+.PHONY: bench-smoke
+bench-smoke:
+	$(UV) run pytest -q tests/test_benchmark_smoke.py
+
+.PHONY: bench-hnsw-vs-seqscan
+bench-hnsw-vs-seqscan:
+	$(PY) -m benchmark.hnsw_vs_seqscan \
+		--k $(BENCH_K) \
+		--n-queries $(BENCH_N_QUERIES) \
+		--seed $(BENCH_SEED) \
+		--ef-search $(BENCH_EF_SEARCH)
+
+.PHONY: bench-hnsw-vs-seqscan-dry
+bench-hnsw-vs-seqscan-dry:
+	$(PY) -m benchmark.hnsw_vs_seqscan --dry-run
+
+.PHONY: bench-hybrid
+bench-hybrid:
+	$(PY) -m benchmark.hybrid_search_bench \
+		--k $(BENCH_K) \
+		--n-queries $(BENCH_N_QUERIES) \
+		--seed $(BENCH_SEED) \
+		--ef-search $(BENCH_EF_SEARCH)
+
+.PHONY: bench-indb-appside
+bench-indb-appside:
+	$(PY) -m benchmark.indb_vs_appside \
+		--k $(BENCH_K) \
+		--n-queries $(BENCH_N_QUERIES) \
+		--seed $(BENCH_SEED) \
+		--ef-search $(BENCH_EF_SEARCH)
+
+.PHONY: bench-hnsw-sweep-quick
+bench-hnsw-sweep-quick:
+	$(PY) -m benchmark.hnsw_param_sweep --quick --n-queries 8 --seed $(BENCH_SEED)
+
+.PHONY: bench-hnsw-sweep
+bench-hnsw-sweep:
+	$(PY) -m benchmark.hnsw_param_sweep --n-queries 12 --seed $(BENCH_SEED)
+
+.PHONY: bench-chunk
+bench-chunk:
+	$(PY) -m benchmark.chunk_size_bench
+
+.PHONY: bench-chunk-teardown
+bench-chunk-teardown:
+	$(PY) -m benchmark.chunk_size_bench --teardown-only
