@@ -27,6 +27,8 @@ def detect_pivot_points(
     df: pd.DataFrame,
     *,
     order: int = 5,
+    tolerance_pct: float = 0.025,
+    range_tolerance_ratio: float = 0.01,
 ) -> list[SRZone]:
     """Detect support and resistance zones using local pivot highs/lows.
 
@@ -40,6 +42,9 @@ def detect_pivot_points(
         df: OHLCV DataFrame for a *single symbol*, sorted by time.
             Must contain columns: symbol, high, low, close.
         order: Half-window size for pivot detection (default 5 → 11-bar window).
+        tolerance_pct: Cluster pivots within ``median_close * tolerance_pct``.
+        range_tolerance_ratio: Also cluster within this fraction of the full
+            ``high.max() - low.min()`` span so wide historical ranges still merge.
 
     Returns:
         List of ``SRZone`` records.
@@ -63,9 +68,9 @@ def detect_pivot_points(
         if lows[i] == window_l.min():
             pivot_lows.append(float(lows[i]))
 
-    # Use 1.5% of the median close as default clustering tolerance
     median_close = float(np.median(df["close"].values))
-    tolerance = median_close * 0.015
+    price_range = float(df["high"].max()) - float(df["low"].min())
+    tolerance = max(median_close * tolerance_pct, price_range * range_tolerance_ratio)
 
     zones: list[SRZone] = []
     zones.extend(_cluster_levels(pivot_highs, symbol, "RESISTANCE", tolerance))
@@ -108,7 +113,13 @@ def _cluster_levels(
     ]
 
 
-def detect_sr_zones(df: pd.DataFrame, *, order: int = 5) -> list[SRZone]:
+def detect_sr_zones(
+    df: pd.DataFrame,
+    *,
+    order: int = 5,
+    tolerance_pct: float = 0.025,
+    range_tolerance_ratio: float = 0.01,
+) -> list[SRZone]:
     """Detect S/R zones across all symbols in a DataFrame.
 
     Delegates to :func:`detect_pivot_points` per symbol.
@@ -116,7 +127,14 @@ def detect_sr_zones(df: pd.DataFrame, *, order: int = 5) -> list[SRZone]:
     zones: list[SRZone] = []
     for _symbol, grp in df.groupby("symbol", sort=False):
         grp = grp.sort_values("time").reset_index(drop=True)
-        zones.extend(detect_pivot_points(grp, order=order))
+        zones.extend(
+            detect_pivot_points(
+                grp,
+                order=order,
+                tolerance_pct=tolerance_pct,
+                range_tolerance_ratio=range_tolerance_ratio,
+            )
+        )
     return zones
 
 

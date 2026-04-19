@@ -74,7 +74,7 @@ async def get_ohlcv(
 async def get_ohlcv_latest(
     conn: DbConn,
     symbol: str,
-    n: int = Query(default=30, ge=1, le=1000, description="Number of latest sessions"),
+    n: int = Query(default=30, ge=1, le=5000, description="Number of latest sessions"),
 ) -> list[dict[str, object]]:
     """Return the latest `n` OHLCV rows for `symbol` (ordered oldest→newest)."""
     rows = await (

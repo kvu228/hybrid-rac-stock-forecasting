@@ -39,6 +39,8 @@ class FullRacContext:
     sr_position_ratio: float | None
     # Block 3
     neighbor_ids: list[int]
+    # Same KNN ordering as ``compute_full_rac_context`` (label + cosine distance per row).
+    neighbor_label_distances: list[tuple[int | None, float]]
 
 
 async def compute_rac_context(
@@ -70,6 +72,33 @@ async def compute_rac_context(
     )
 
 
+async def _fetch_knn_label_distances(
+    conn: psycopg.AsyncConnection[tuple[object, ...]],
+    *,
+    query_embedding: list[float],
+    k: int,
+) -> list[tuple[int | None, float]]:
+    """Top-``k`` neighbors by cosine distance (same ordering as ``compute_full_rac_context`` KNN)."""
+    if k <= 0:
+        return []
+    qv = _format_vector(query_embedding)
+    cur = await conn.execute(
+        """
+        SELECT pe.label, (pe.embedding <=> %(query_vec)s::vector) AS cos_dist
+        FROM pattern_embeddings pe
+        ORDER BY pe.embedding <=> %(query_vec)s::vector
+        LIMIT %(k)s
+        """,
+        {"query_vec": qv, "k": k},
+    )
+    rows = await cur.fetchall()
+    out: list[tuple[int | None, float]] = []
+    for r in rows:
+        lab = int(r[0]) if r[0] is not None else None
+        out.append((lab, float(r[1])))
+    return out
+
+
 async def compute_full_rac_context(
     conn: psycopg.AsyncConnection[tuple[object, ...]],
     *,
@@ -93,11 +122,12 @@ async def compute_full_rac_context(
         )
     ).fetchone()
     if row is None:
-        return FullRacContext(0, None, None, None, None, None, None, None, None, None, [])
+        return FullRacContext(0, None, None, None, None, None, None, None, None, None, [], [])
 
     rr = cast(tuple[Any, ...], row)
     label_dist = cast(dict[str, int], rr[2]) if isinstance(rr[2], dict) else None
     neighbor_ids = cast(list[Any], rr[10]) if rr[10] is not None else []
+    nld = await _fetch_knn_label_distances(conn, query_embedding=query_embedding, k=k)
     return FullRacContext(
         total_neighbors=int(rr[0]),
         avg_cosine_dist=float(rr[1]) if rr[1] is not None else None,
@@ -110,5 +140,6 @@ async def compute_full_rac_context(
         dist_to_resistance=float(rr[8]) if rr[8] is not None else None,
         sr_position_ratio=float(rr[9]) if rr[9] is not None else None,
         neighbor_ids=[int(x) for x in neighbor_ids],
+        neighbor_label_distances=nld,
     )
 

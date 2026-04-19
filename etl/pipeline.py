@@ -264,7 +264,12 @@ def _cmd_detect_sr(args: argparse.Namespace, database_url: str) -> None:
         print("No OHLCV data found for the given symbols.")
         return
 
-    zones = detect_sr_zones(df, order=args.order)
+    zones = detect_sr_zones(
+        df,
+        order=args.order,
+        tolerance_pct=args.tolerance_pct,
+        range_tolerance_ratio=args.range_tolerance_ratio,
+    )
     inserted = ingest_sr_zones(zones, database_url)
     support_count = sum(1 for z in zones if z.zone_type == "SUPPORT")
     resist_count = sum(1 for z in zones if z.zone_type == "RESISTANCE")
@@ -473,6 +478,18 @@ def main() -> None:
     p_sr.add_argument("--symbols", nargs="+", help="Ticker symbols")
     p_sr.add_argument("--symbols-file", help="Text file with one symbol per line")
     p_sr.add_argument("--order", type=int, default=5, help="Pivot half-window size (default: 5)")
+    p_sr.add_argument(
+        "--tolerance-pct",
+        type=float,
+        default=0.025,
+        help="Pivot cluster width as fraction of median close (default: 0.025)",
+    )
+    p_sr.add_argument(
+        "--range-tolerance-ratio",
+        type=float,
+        default=0.01,
+        help="Min cluster width as fraction of (high.max-low.min) (default: 0.01)",
+    )
     p_sr.add_argument("--database-url", default=os.getenv("DATABASE_URL"), help="SQLAlchemy/psycopg URL")
 
     p_purge = sub.add_parser(

@@ -107,6 +107,9 @@ async def test_rac_similar_and_full_context_and_prediction_roundtrip(client: htt
     ctx = resp.json()
     assert ctx["total_neighbors"] == 3
     assert len(ctx["neighbor_ids"]) == 3
+    assert "neighbor_label_distances" in ctx
+    assert len(ctx["neighbor_label_distances"]) == 3
+    assert ctx["neighbor_label_distances"][0]["cosine_distance"] == pytest.approx(0.0)
 
     # predict should persist into rac_predictions (linked to closest neighbor id)
     resp = await client.post(
