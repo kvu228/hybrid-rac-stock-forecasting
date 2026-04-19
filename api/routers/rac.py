@@ -10,10 +10,13 @@ procedures to demonstrate:
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
+from pathlib import Path
 from typing import Any, cast
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from api.deps import DbConn
 from api.schemas import (
@@ -22,14 +25,75 @@ from api.schemas import (
     RacFullContextRequest,
     RacFullContextResponse,
     RacPredictionRow,
+    RacQueryEmbeddingRequest,
+    RacQueryEmbeddingResponse,
     RacSimilarPatternsRequest,
     RacSimilarPatternsResponse,
 )
 from rac.context_enricher import compute_full_rac_context, compute_rac_context
+from rac.query_window import (
+    build_normalized_query_window,
+    embedding_from_normalized_window,
+    ohlcv_rows_to_dataframe,
+)
 from rac.rac_classifier import predict_and_persist
 from rac.retriever import find_similar_patterns
 
 router = APIRouter()
+
+
+@router.post("/rac/query-embedding", response_model=RacQueryEmbeddingResponse)
+async def rac_query_embedding(conn: DbConn, req: RacQueryEmbeddingRequest) -> dict[str, object]:
+    """Build a 30-session normalized window ending at ``window_end`` and encode with the CNN."""
+    model_path = Path(os.environ.get("CNN_ENCODER_PATH", "ml/model_store/cnn_encoder.pt"))
+    if not model_path.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=f"CNN encoder weights not found at {model_path}. Train with ml/train_pipeline.py or set CNN_ENCODER_PATH.",
+        )
+
+    symbol = req.symbol.strip().upper()
+    cur = await conn.execute(
+        """
+        SELECT time, symbol, open, high, low, close, volume
+        FROM stock_ohlcv
+        WHERE symbol = %(sym)s AND time <= %(end)s
+        ORDER BY time DESC
+        LIMIT 500
+        """,
+        {"sym": symbol, "end": req.window_end},
+    )
+    rows = list(reversed(await cur.fetchall()))
+    df = ohlcv_rows_to_dataframe(rows)
+    try:
+        normed, w_start, w_end, slice_df = build_normalized_query_window(df, req.window_end)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    device = (os.environ.get("TORCH_DEVICE") or "cpu").strip() or "cpu"
+    emb = await asyncio.to_thread(embedding_from_normalized_window, normed, model_path, device=device)
+
+    ohlcv: list[dict[str, object]] = []
+    for _, r in slice_df.iterrows():
+        ts = r["time"]
+        ohlcv.append(
+            {
+                "time": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": int(r["volume"]),
+            }
+        )
+
+    return {
+        "symbol": symbol,
+        "window_start": w_start,
+        "window_end": w_end,
+        "query_embedding": emb,
+        "ohlcv": ohlcv,
+    }
 
 
 @router.post("/rac/similar-patterns", response_model=RacSimilarPatternsResponse)

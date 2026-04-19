@@ -8,7 +8,7 @@ Schemas are organized by domain:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -150,3 +150,100 @@ class RacPredictionRow(BaseModel):
     neighbor_label_dist: dict[str, int] | None
     neighbor_ids: list[int] | None
     predicted_at: datetime
+
+
+# --- ETL jobs ---
+
+
+class EtlJobAcceptedResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class EtlBackfillRequest(BaseModel):
+    symbols: list[str] = Field(..., min_length=1)
+    start: date
+    end: date
+
+    chunk_days: int = Field(default=365, ge=1, le=3650)
+    concurrency: int = Field(default=1, ge=1, le=32)
+    requests_per_minute: int = Field(default=55, ge=1, le=500)
+    rate_limit_burst: int = Field(default=1, ge=1, le=50)
+
+
+class EtlIncrementalRequest(BaseModel):
+    symbols: list[str] = Field(..., min_length=1)
+    end: date | None = Field(
+        default=None,
+        description="If omitted, server uses DB ``SELECT now()::date`` when the job runs.",
+    )
+    chunk_days: int = Field(default=365, ge=1, le=3650)
+    concurrency: int = Field(default=1, ge=1, le=32)
+    requests_per_minute: int = Field(default=55, ge=1, le=500)
+    rate_limit_burst: int = Field(default=1, ge=1, le=50)
+
+
+class EtlJobStatusResponse(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    message: str
+    result: dict[str, object] | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- Benchmark ---
+
+
+class BenchmarkExplainRequest(BaseModel):
+    """Whitelisted EXPLAIN templates (no arbitrary SQL)."""
+
+    query_kind: str = Field(
+        ...,
+        description="One of: hnsw_knn, seqscan_knn, hybrid_context (uses first row in pattern_embeddings).",
+    )
+    k: int = Field(default=20, ge=1, le=200)
+    ef_search: int | None = Field(default=None, ge=1, le=1000, description="Optional SET hnsw.ef_search for this session.")
+
+
+class BenchmarkExplainResponse(BaseModel):
+    query_kind: str
+    plan_text: str
+
+
+class BenchmarkStatsResponse(BaseModel):
+    available: bool
+    hint: str | None = None
+    statements: list[dict[str, object]] = Field(default_factory=list)
+
+
+class BenchmarkResultItem(BaseModel):
+    name: str
+    size_bytes: int
+
+
+# --- RAC query embedding ---
+
+
+class RacQueryEmbeddingRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=32)
+    window_end: datetime = Field(..., description="Last session timestamp of the 30-bar window (UTC).")
+
+
+class OHLCVBar(BaseModel):
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+
+class RacQueryEmbeddingResponse(BaseModel):
+    symbol: str
+    window_start: datetime
+    window_end: datetime
+    query_embedding: list[float]
+    ohlcv: list[OHLCVBar]

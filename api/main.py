@@ -62,13 +62,17 @@ app.add_middleware(
 )
 
 # --- Register routers ---
-from api.routers.ohlcv import router as ohlcv_router  # noqa: E402
+from api.routers.benchmark import router as benchmark_router  # noqa: E402
+from api.routers.etl import router as etl_router  # noqa: E402
 from api.routers.metadata import router as metadata_router  # noqa: E402
+from api.routers.ohlcv import router as ohlcv_router  # noqa: E402
 from api.routers.rac import router as rac_router  # noqa: E402
 
 app.include_router(ohlcv_router, prefix="/api", tags=["OHLCV"])
 app.include_router(metadata_router, prefix="/api", tags=["Metadata"])
 app.include_router(rac_router, prefix="/api", tags=["RAC"])
+app.include_router(etl_router, prefix="/api", tags=["ETL"])
+app.include_router(benchmark_router, prefix="/api", tags=["Benchmark"])
 
 
 @app.get("/api/health")
