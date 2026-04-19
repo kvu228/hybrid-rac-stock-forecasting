@@ -154,3 +154,32 @@ VALUES (%s, %s, %s, %s, TRUE)
         conn.commit()
 
     return len(zones)
+
+
+def purge_inactive_sr_zones(database_url: str, *, symbols: list[str] | None = None) -> int:
+    """DELETE rows in ``support_resistance_zones`` where ``is_active`` is FALSE.
+
+    Each ``detect-sr`` run deactivates prior zones and inserts new ones, so inactive
+    rows accumulate. This removes them to keep the table small.
+
+    Args:
+        database_url: SQLAlchemy or psycopg-style Postgres URL.
+        symbols: If set, only inactive rows for these symbols are deleted.
+            If ``None``, every inactive row in the table is deleted.
+
+    Returns:
+        Number of rows deleted (``psycopg`` ``rowcount``).
+    """
+    url = _normalize_psycopg_url(database_url)
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            if symbols:
+                cur.execute(
+                    "DELETE FROM support_resistance_zones WHERE is_active = FALSE AND symbol = ANY(%s)",
+                    (symbols,),
+                )
+            else:
+                cur.execute("DELETE FROM support_resistance_zones WHERE is_active = FALSE")
+            deleted = cur.rowcount
+        conn.commit()
+    return int(deleted) if deleted is not None and deleted >= 0 else 0
