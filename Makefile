@@ -71,6 +71,8 @@ help:
 	@echo "Phase 4 (encoder weights -> pattern_embeddings):"
 	@echo "  make ml-train-encoder-synthetic - smoke train (synthetic OHLCV)"
 	@echo "  make ml-train-encoder       - train from OHLCV_TSV (default: small fixture)"
+	@echo "  make ml-train-encoder-db    - train from stock_ohlcv (VN100 list, DATABASE_URL)"
+	@echo "  make ml-train-encoder-db-symbol SYMBOL=VCB - same, single symbol"
 	@echo "  make ml-embed-symbol SYMBOL=VCB - embed one symbol (truncate + insert)"
 	@echo "  make ml-embed-vn100         - loop all tickers in TICKERS_VN100 (sequential)"
 	@echo ""
@@ -79,6 +81,7 @@ help:
 	@echo "  make etl-incremental-vn100 END=2026-04-19 CONCURRENCY=2 RPM=55"
 	@echo "  make etl-generate-windows-vn100 WIN_START=2015-01-01 WIN_END=2025-12-31"
 	@echo "  make ml-train-encoder ML_ENCODER_EPOCHS=12 OHLCV_TSV=path/to/export.tsv"
+	@echo "  make ml-train-encoder-db WIN_START=2015-01-01 WIN_END=2025-12-31"
 	@echo "  make ml-embed-vn100 ML_EMBED_BATCH=256"
 
 .PHONY: sync
@@ -208,6 +211,26 @@ ml-train-encoder-synthetic:
 ml-train-encoder:
 	$(PY) -m ml.train_pipeline \
 		--ohlcv-tsv $(OHLCV_TSV) \
+		--epochs $(ML_ENCODER_EPOCHS) \
+		--batch-size $(ML_ENCODER_BATCH) \
+		--out $(ML_ENCODER_OUT) \
+		--device $(ML_DEVICE)
+
+.PHONY: ml-train-encoder-db
+ml-train-encoder-db:
+	$(PY) -m ml.train_pipeline --from-db \
+		$(WIN_DATE_FLAGS) \
+		--symbols-file $(TICKERS_VN100) \
+		--epochs $(ML_ENCODER_EPOCHS) \
+		--batch-size $(ML_ENCODER_BATCH) \
+		--out $(ML_ENCODER_OUT) \
+		--device $(ML_DEVICE)
+
+.PHONY: ml-train-encoder-db-symbol
+ml-train-encoder-db-symbol: _require-symbol
+	$(PY) -m ml.train_pipeline --from-db \
+		$(WIN_DATE_FLAGS) \
+		--symbols $(SYMBOL) \
 		--epochs $(ML_ENCODER_EPOCHS) \
 		--batch-size $(ML_ENCODER_BATCH) \
 		--out $(ML_ENCODER_OUT) \

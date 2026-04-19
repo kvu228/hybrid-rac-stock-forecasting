@@ -9,16 +9,19 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from dotenv import load_dotenv
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from typing import Sequence
 
-from etl.feature_engineer import WindowRecord, generate_windows, train_test_split_by_time
+from etl.feature_engineer import WindowRecord, forward_fill_trading_days, generate_windows, train_test_split_by_time
+from etl.pipeline import _fetch_ohlcv_from_db, _load_symbols
 from ml.cnn_encoder import CNNEncoder, EncoderConfig
 
 
@@ -191,20 +194,64 @@ def save_encoder(encoder: CNNEncoder, out_path: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    def _parse_date(s: str) -> date:
+        return date.fromisoformat(s)
+
     parser = argparse.ArgumentParser(description="Train CNN encoder for pgvector embeddings.")
-    parser.add_argument("--ohlcv-tsv", type=Path, default=Path("tests/fixtures/ohlcv_small.tsv"))
-    parser.add_argument(
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument(
         "--synthetic",
         action="store_true",
         help="Use synthetic OHLCV instead of reading from --ohlcv-tsv (for smoke runs).",
     )
+    src.add_argument(
+        "--from-db",
+        action="store_true",
+        help="Load OHLCV from Postgres table stock_ohlcv (uses DATABASE_URL or --database-url).",
+    )
+    parser.add_argument("--ohlcv-tsv", type=Path, default=Path("tests/fixtures/ohlcv_small.tsv"))
+    parser.add_argument("--symbols", nargs="*", default=None, help="With --from-db: ticker symbols (space-separated).")
+    parser.add_argument("--symbols-file", default=None, help="With --from-db: text file, one symbol per line (# comments ok).")
+    parser.add_argument("--database-url", default="", help="With --from-db: SQLAlchemy URL (defaults to DATABASE_URL).")
+    parser.add_argument("--start", type=_parse_date, default=None, help="With --from-db: inclusive start date (YYYY-MM-DD).")
+    parser.add_argument("--end", type=_parse_date, default=None, help="With --from-db: inclusive end date (YYYY-MM-DD).")
     parser.add_argument("--out", type=Path, default=Path("ml/model_store/cnn_encoder.pt"))
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--device", type=str, default=os.environ.get("TORCH_DEVICE", "cpu"))
     args = parser.parse_args(argv)
 
-    df = _make_synthetic_ohlcv() if args.synthetic else _load_ohlcv_tsv(args.ohlcv_tsv)
+    load_dotenv(override=False)
+
+    if str(args.device).lower().startswith("cuda"):
+        if getattr(torch.version, "cuda", None) is None:
+            raise SystemExit(
+                "device=cuda but this PyTorch wheel is CPU-only (no CUDA build). "
+                "Install PyTorch with CUDA from https://pytorch.org/get-started/locally/ "
+                "(e.g. uv pip with the cu12* index URL) or use --device cpu."
+            )
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "device=cuda but torch.cuda.is_available() is False (GPU/driver?). Use --device cpu or fix CUDA."
+            )
+
+    if args.from_db:
+        if not args.symbols and not args.symbols_file:
+            raise SystemExit("With --from-db, provide --symbols and/or --symbols-file.")
+        database_url = (args.database_url or "").strip() or (os.getenv("DATABASE_URL") or "").strip()
+        if not database_url:
+            raise SystemExit("DATABASE_URL is required for --from-db (or pass --database-url).")
+        symbols = _load_symbols(list(args.symbols) if args.symbols else None, args.symbols_file)
+        df = _fetch_ohlcv_from_db(database_url, symbols, args.start, args.end)
+        if df.empty:
+            raise SystemExit("No rows returned from stock_ohlcv for the given symbols/date range.")
+        df = forward_fill_trading_days(df)
+        if df.empty:
+            raise SystemExit("OHLCV became empty after forward-fill; check input range.")
+    elif args.synthetic:
+        df = _make_synthetic_ohlcv()
+    else:
+        df = _load_ohlcv_tsv(args.ohlcv_tsv)
     encoder, metrics = train_from_ohlcv(
         df,
         train_cfg=TrainConfig(epochs=args.epochs, batch_size=args.batch_size, device=args.device),
