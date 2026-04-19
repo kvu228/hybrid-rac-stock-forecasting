@@ -29,8 +29,9 @@ Hệ thống **nhận diện mẫu hình** và **dự báo chứng khoán** dự
 - **Phase 3** ✅ Feature Engineering (sliding windows, S/R detection, train/test split)
 - **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
 - **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
+- **Phase 6** ✅ DB benchmarks (HNSW vs exact, hybrid search, in-DB vs app, HNSW sweep, chunk intervals → `benchmark/results/`)
 - **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
-- **Phase 6, 8** — Xem `IMPLEMENTATION_PLAN.md`
+- **Phase 8** — Xem `IMPLEMENTATION_PLAN.md`
 
 ## Chuẩn bị môi trường
 
@@ -48,7 +49,7 @@ uv sync --dev
 
 ### 0b) Makefile (tuỳ chọn — gom các CLI hay dùng)
 
-Repo có [`Makefile`](Makefile) để gom các lệnh thường dùng (`db-up`, `migrate`, ETL VN100, Phase 3/4 — windows + S/R + train/embedding, lint/test, API…).
+Repo có [`Makefile`](Makefile) để gom các lệnh thường dùng (`db-up`, `migrate`, ETL VN100, Phase 3/4 — windows + S/R + train/embedding, **Phase 6 benchmarks**, lint/test, API…).
 
 ```bash
 make help
@@ -98,6 +99,14 @@ Giả sử `DATABASE_URL` đã đúng (`.env` hoặc export), TimescaleDB/pgvect
 5. **Quan sát tải HNSW / kích thước chỉ mục (tuỳ chọn)**  
    Trong `psql`, ví dụ:  
    `SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size FROM pg_stat_user_indexes WHERE relname = 'pattern_embeddings' ORDER BY indexname;`
+
+6. **Phase 6 — benchmark hiệu năng DB (sau khi đã có `pattern_embeddings` + `stock_ohlcv`)**  
+   Chi tiết: [`benchmark/README.md`](benchmark/README.md). **Cảnh báo:** các target HNSW/sweep **DROP và CREATE lại** `idx_embedding_hnsw` — chỉ chạy trên DB dev.  
+   - `make bench-smoke` — test nhẹ (parse `EXPLAIN`; có thêm test DB nếu có `DATABASE_URL`).  
+   - `make bench-hnsw-vs-seqscan` — HNSW vs quét chính xác, P50/P95/P99, recall (override: `BENCH_K=`, `BENCH_N_QUERIES=`, `BENCH_SEED=`, `BENCH_EF_SEARCH=`).  
+   - `make bench-hybrid`, `make bench-indb-appside` — hybrid symbol filter; in-DB vs app-side RAC context.  
+   - `make bench-hnsw-sweep-quick` / `make bench-hnsw-sweep` — lưới tham số HNSW (bản đầy đủ rất lâu).  
+   - `make bench-chunk` — so sánh chunk 1 tuần / 1 tháng / 3 tháng (tạo bảng `bench_stock_ohlcv_*`); `make bench-chunk-teardown` để xóa các bảng đó.
 
 Xem `make help` để liệt kê đầy đủ target và biến override.
 
@@ -323,6 +332,27 @@ uv run python -m ml.embedding_generator --symbol VCB --truncate-symbol --model m
 
 ---
 
+## Chạy Phase 6 (Benchmark DB)
+
+Cần `DATABASE_URL`, schema đã migrate, dữ liệu **`pattern_embeddings`** (các script vector) và **`stock_ohlcv`** (chunk benchmark). Kết quả: `benchmark/results/` + `benchmark/results/explain/` (gitignored).
+
+**Makefile (khuyến nghị):** `make bench-smoke`, `make bench-hnsw-vs-seqscan`, `make bench-hybrid`, `make bench-indb-appside`, `make bench-hnsw-sweep-quick`, `make bench-hnsw-sweep`, `make bench-chunk`, `make bench-chunk-teardown`. Biến: `BENCH_K`, `BENCH_N_QUERIES`, `BENCH_SEED`, `BENCH_EF_SEARCH`.
+
+**Tương đương `uv run`:**
+
+```bash
+uv run pytest -q tests/test_benchmark_smoke.py
+uv run python -m benchmark.hnsw_vs_seqscan --k 20 --n-queries 30 --seed 42 --ef-search 100
+uv run python -m benchmark.hybrid_search_bench --k 20 --n-queries 30
+uv run python -m benchmark.indb_vs_appside --k 20 --n-queries 30
+uv run python -m benchmark.hnsw_param_sweep --quick
+uv run python -m benchmark.chunk_size_bench
+```
+
+Xem thêm [`benchmark/README.md`](benchmark/README.md).
+
+---
+
 ## Chạy Phase 7 (FastAPI REST API)
 
 > API auto-load `.env` và cần `DATABASE_URL` trỏ tới PostgreSQL đã chạy + đã `alembic upgrade head`.
@@ -383,8 +413,9 @@ This repo implements an **equity pattern recognition** and **stock forecasting**
 - **Phase 3** ✅ Feature Engineering (sliding windows, S/R detection, train/test split)
 - **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
 - **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
+- **Phase 6** ✅ Database benchmarks (HNSW vs exact, hybrid search, in-DB vs app, HNSW sweep, chunk intervals → `benchmark/results/`)
 - **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
-- **Phase 6, 8** — See `IMPLEMENTATION_PLAN.md`
+- **Phase 8** — See `IMPLEMENTATION_PLAN.md`
 
 ## Environment Setup
 
@@ -403,7 +434,7 @@ uv sync --dev
 
 ### 0b) Makefile (optional — common CLI shortcuts)
 
-This repo includes a [`Makefile`](Makefile) that wraps frequent commands (`db-up`, `migrate`, VN100 ETL, Phase 3/4 windows + S/R + train/embeddings, lint/tests, API, …).
+This repo includes a [`Makefile`](Makefile) that wraps frequent commands (`db-up`, `migrate`, VN100 ETL, Phase 3/4 windows + S/R + train/embeddings, **Phase 6 benchmarks**, lint/tests, API, …).
 
 ```bash
 make help
@@ -429,6 +460,13 @@ Assume `DATABASE_URL` is set (via `.env` or your shell), Postgres (TimescaleDB +
 3. **Phase 3 — windows export + S/R metadata for hybrid context** — one shot (ordered: windows → S/R): `make phase3-vn100`. Or split: `make etl-generate-windows-vn100` then `make etl-detect-sr-vn100`. Per symbol: `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-symbol SYMBOL=VCB`. Optional date filters: `WIN_START=`, `WIN_END=`. Output dir: `WINDOWS_OUT=` (default `data/windows`). Optional (after many `detect-sr` runs): `make etl-purge-inactive-sr-vn100` or `make etl-purge-inactive-sr-all`, or `POST /api/sr-zones/purge-inactive`.
 4. **Phase 4 — encoder → `pattern_embeddings`** — smoke: `make ml-train-encoder-synthetic`. Train straight from **`stock_ohlcv`**: `make ml-train-encoder-db` or `make ml-train-encoder-db-symbol SYMBOL=VCB` (optional `WIN_START=` / `WIN_END=`). Or train from a TSV: `make ml-train-encoder OHLCV_TSV=path/to/export.tsv ML_ENCODER_EPOCHS=8`. Generate vectors + insert: `make ml-embed-vn100` (sequential over `TICKERS_VN100`) or `make ml-embed-symbol SYMBOL=VCB`. Tune `ML_EMBED_BATCH=`, `ML_DEVICE=` (or `TORCH_DEVICE`).
 5. **Optional: inspect HNSW / index sizes in `psql`** — e.g. `SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size FROM pg_stat_user_indexes WHERE relname = 'pattern_embeddings' ORDER BY indexname;`
+
+6. **Phase 6 — database benchmarks** (after **`pattern_embeddings`** + **`stock_ohlcv`** exist) — see [`benchmark/README.md`](benchmark/README.md). **Warning:** HNSW/sweep targets **DROP and recreate** `idx_embedding_hnsw` — use a dev database only.  
+   - `make bench-smoke` — lightweight tests (optional live DB checks when `DATABASE_URL` is set).  
+   - `make bench-hnsw-vs-seqscan` — HNSW vs exact KNN + `EXPLAIN` (override `BENCH_K`, `BENCH_N_QUERIES`, `BENCH_SEED`, `BENCH_EF_SEARCH`).  
+   - `make bench-hybrid`, `make bench-indb-appside` — symbol-filtered KNN; in-DB vs app-side RAC context.  
+   - `make bench-hnsw-sweep-quick` / `make bench-hnsw-sweep` — HNSW parameter grid (full grid is very slow).  
+   - `make bench-chunk` — compare 1w / 1m / 3m chunk intervals (creates `bench_stock_ohlcv_*` tables); `make bench-chunk-teardown` drops them.
 
 Run `make help` for the full target list.
 
@@ -632,6 +670,27 @@ uv run python -m ml.train_pipeline --ohlcv-tsv path/to/ohlcv.tsv --epochs 8 --ba
 ```bash
 uv run python -m ml.embedding_generator --symbol VCB --truncate-symbol --model ml/model_store/cnn_encoder.pt --batch-size 512
 ```
+
+---
+
+## Run Phase 6 (Database benchmarks)
+
+Requires `DATABASE_URL`, applied migrations, populated **`pattern_embeddings`** (vector scripts) and **`stock_ohlcv`** (chunk benchmark). Outputs go to `benchmark/results/` and `benchmark/results/explain/` (gitignored).
+
+**Makefile (recommended):** `make bench-smoke`, `make bench-hnsw-vs-seqscan`, `make bench-hybrid`, `make bench-indb-appside`, `make bench-hnsw-sweep-quick`, `make bench-hnsw-sweep`, `make bench-chunk`, `make bench-chunk-teardown`. Override with `BENCH_K`, `BENCH_N_QUERIES`, `BENCH_SEED`, `BENCH_EF_SEARCH`.
+
+**Equivalent `uv run`:**
+
+```bash
+uv run pytest -q tests/test_benchmark_smoke.py
+uv run python -m benchmark.hnsw_vs_seqscan --k 20 --n-queries 30 --seed 42 --ef-search 100
+uv run python -m benchmark.hybrid_search_bench --k 20 --n-queries 30
+uv run python -m benchmark.indb_vs_appside --k 20 --n-queries 30
+uv run python -m benchmark.hnsw_param_sweep --quick
+uv run python -m benchmark.chunk_size_bench
+```
+
+See also [`benchmark/README.md`](benchmark/README.md).
 
 ---
 
