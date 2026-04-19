@@ -46,6 +46,70 @@ Hệ thống **nhận diện mẫu hình** và **dự báo chứng khoán** dự
 uv sync --dev
 ```
 
+### 0b) Makefile (tuỳ chọn — gom các CLI hay dùng)
+
+Repo có [`Makefile`](Makefile) để gom các lệnh thường dùng (`db-up`, `migrate`, ETL VN100, Phase 3/4 — windows + S/R + train/embedding, lint/test, API…).
+
+```bash
+make help
+```
+
+Ví dụ nhanh:
+
+```bash
+make db-up
+make migrate
+make etl-backfill-vn100          # END mặc định = ngày hôm nay (theo `uv run python`)
+make etl-backfill-vn100 END=2026-04-19
+make etl-incremental-vn100 END=2026-04-19
+make api
+```
+
+### Makefile — thứ tự gợi ý trên DB thật (Phase 2 → 3 → 4, VN100)
+
+Giả sử `DATABASE_URL` đã đúng (`.env` hoặc export), TimescaleDB/pgvector đã chạy và đã migrate.
+
+1. **Khởi tạo DB (một lần / khi đổi môi trường)**  
+   `make db-up` → `make migrate`
+
+2. **Phase 2 — nạp OHLCV đủ lịch sử**  
+   Lần đầu: `make etl-backfill-vn100` (tuỳ chỉnh `START=`, `END=`, `CONCURRENCY=`, `RPM=`).  
+   Các lần sau: `make etl-incremental-vn100 END=YYYY-MM-DD`.
+
+3. **Phase 3 — feature + metadata cho hybrid context**  
+   Gói một lệnh (đúng thứ tự: export windows → S/R DB):  
+   `make phase3-vn100`  
+   Tách riêng nếu cần:  
+   - `make etl-generate-windows-vn100` — ghi `data/windows/` (`WINDOWS_OUT=...`, tùy chọn lọc ngày `WIN_START=` / `WIN_END=`).  
+   - `make etl-detect-sr-vn100` — đổ `support_resistance_zones` (`SR_ORDER=5` mặc định).  
+   Theo từng mã: `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-symbol SYMBOL=VCB`.  
+   Tuỳ chọn (sau nhiều lần chạy `detect-sr`, để bảng không phình): `make etl-purge-inactive-sr-vn100` hoặc `make etl-purge-inactive-sr-all` (hoặc API `POST /api/sr-zones/purge-inactive`).
+
+4. **Phase 4 — encoder → `pattern_embeddings`**  
+   - Smoke nhanh: `make ml-train-encoder-synthetic` (ghi `ML_ENCODER_OUT`, mặc định `ml/model_store/cnn_encoder.pt`).  
+   - Train “nghiêm” từ TSV OHLCV (cột `time` + OHLCV):  
+     `make ml-train-encoder OHLCV_TSV=đường/dẫn/export.tsv ML_ENCODER_EPOCHS=8 ML_ENCODER_BATCH=256`  
+   - Sinh embedding vào DB (xoá embedding cũ của mã rồi insert lại):  
+     - Cả danh sách VN100 (tuần tự, dễ đo thời gian từng mã): `make ml-embed-vn100`  
+     - Một mã: `make ml-embed-symbol SYMBOL=VCB`  
+   Tuỳ chỉnh: `ML_EMBED_BATCH=`, `ML_DEVICE=` (hoặc biến môi trường `TORCH_DEVICE`).
+
+5. **Quan sát tải HNSW / kích thước chỉ mục (tuỳ chọn)**  
+   Trong `psql`, ví dụ:  
+   `SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size FROM pg_stat_user_indexes WHERE relname = 'pattern_embeddings' ORDER BY indexname;`
+
+Xem `make help` để liệt kê đầy đủ target và biến override.
+
+`make ml-embed-vn100` dùng `grep` và vòng lặp `while` trong shell (POSIX/Git Bash). Nếu GNU Make của bạn gọi `cmd.exe` làm shell mặc định, dùng Git Bash hoặc lặp tay `make ml-embed-symbol SYMBOL=...` / `uv run python -m ml.embedding_generator ...` theo từng mã.
+
+**Windows:** PowerShell thường **không có `make` sẵn**. Cách phổ biến là dùng **Git Bash** (kèm Git for Windows) hoặc cài GNU Make riêng, rồi chạy `make ...` từ đó.
+
+Nếu bạn muốn copy/paste one-liner PowerShell (tránh lỗi line continuation), chạy:
+
+```bash
+make windows-ps-backfill-vn100
+```
+
 ### 1) Cấu hình biến môi trường
 
 ```bash
@@ -169,6 +233,8 @@ python -m etl.pipeline incremental \
 
 ## Chạy Phase 3 (Feature Engineering & Preprocessing)
 
+Makefile tương ứng: `make etl-generate-windows-vn100`, `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-vn100`, `make etl-detect-sr-symbol SYMBOL=VCB`, hoặc gói `make phase3-vn100`; dọn inactive: `make etl-purge-inactive-sr-vn100` / `make etl-purge-inactive-sr-all` (xem mục **Makefile — thứ tự** ở trên).
+
 ### Tạo sliding windows từ OHLCV trong DB
 
 Đọc dữ liệu OHLCV từ DB, forward-fill ngày thiếu, tạo windows [30 phiên × 5 kênh OHLCV], gắn label theo T+5 return, z-score normalize, và chia train/test theo thời gian (80/20).
@@ -205,12 +271,48 @@ python -m etl.pipeline detect-sr --symbols VCB FPT
 python -m etl.pipeline detect-sr --symbols-file etl/tickers_vn100.txt --order 5
 ```
 
+### Dọn dẹp zone không còn active (`is_active = FALSE`)
+
+Mỗi lần `detect-sr` chạy lại, các zone cũ bị đánh dấu inactive và zone mới được insert, nên bảng có thể tích lũy dòng lịch sử. Để xóa hẳn các dòng inactive:
+
+```bash
+# Chỉ các mã trong file (ví dụ VN100)
+python -m etl.pipeline purge-inactive-sr --symbols-file etl/tickers_vn100.txt
+
+# Toàn bộ bảng (mọi mã)
+python -m etl.pipeline purge-inactive-sr --all-inactive
+```
+
+Makefile: `make etl-purge-inactive-sr-vn100`, `make etl-purge-inactive-sr-all`.
+
+API (nên bảo vệ ở môi trường production): `POST /api/sr-zones/purge-inactive` với JSON `{"symbols": ["VCB"]}` hoặc `{"all_inactive": true}` (không dùng đồng thời `symbols` với `all_inactive`).
+
 ### Tests / Lint / Type-check
 
 ```bash
 ruff check .
 mypy .
 pytest -q
+```
+
+## Chạy Phase 4 (ML & embeddings → `pattern_embeddings`)
+
+Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100` (thứ tự tổng thể nằm ở mục **Makefile — thứ tự** phía trên).
+
+**Train encoder (tạo file weights, mặc định `ml/model_store/cnn_encoder.pt`):**
+
+```bash
+# Smoke (OHLCV tổng hợp)
+uv run python -m ml.train_pipeline --synthetic --epochs 1 --batch-size 32 --out ml/model_store/cnn_encoder.pt
+
+# Từ file TSV (cột time + OHLCV; xem fixture tests/fixtures/ohlcv_small.tsv)
+uv run python -m ml.train_pipeline --ohlcv-tsv path/to/ohlcv.tsv --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
+```
+
+**Sinh embedding và INSERT vào Postgres (`--truncate-symbol` xoá embedding cũ của mã đó trước khi nạp lại):**
+
+```bash
+uv run python -m ml.embedding_generator --symbol VCB --truncate-symbol --model ml/model_store/cnn_encoder.pt --batch-size 512
 ```
 
 ---
@@ -237,6 +339,7 @@ Mở docs:
 - `GET /api/ohlcv/{symbol}/latest?n=...`
 - `GET /api/sr-zones/{symbol}?active_only=true|false`
 - `GET /api/sr-zones/{symbol}/distance?price=...`
+- `POST /api/sr-zones/purge-inactive` (xóa dòng S/R có `is_active=false`; xem mục dọn dẹp Phase 3)
 - `POST /api/rac/similar-patterns`
 - `POST /api/rac/context`
 - `POST /api/rac/full-context`
@@ -272,8 +375,10 @@ This repo implements an **equity pattern recognition** and **stock forecasting**
 - **Phase 1** ✅ Infrastructure & DB Schema (TimescaleDB, pgvector, stored procedures, migrations)
 - **Phase 2** ✅ ETL Pipeline (Vnstock fetch → clean → bulk ingest, idempotent upsert)
 - **Phase 3** ✅ Feature Engineering (sliding windows, S/R detection, train/test split)
-- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR)
-- **Phase 4–6, 8** — See `IMPLEMENTATION_PLAN.md`
+- **Phase 4** ✅ (core) ML & Embeddings (CNN encoder + embedding generator into `pattern_embeddings`)
+- **Phase 5** ✅ RAC application layer (stored procedure wrappers + persist predictions)
+- **Phase 7** ✅ (partial) FastAPI REST API (healthcheck, OHLCV, metadata/SR, RAC)
+- **Phase 6, 8** — See `IMPLEMENTATION_PLAN.md`
 
 ## Environment Setup
 
@@ -282,11 +387,53 @@ This repo implements an **equity pattern recognition** and **stock forecasting**
 - Docker Desktop
 - Python 3.12
 - `uv` (package manager)
+- (Optional) GNU **Make** if you want to use the [`Makefile`](Makefile) shortcuts
 
 ### 0) Install dependencies (uv)
 
 ```bash
 uv sync --dev
+```
+
+### 0b) Makefile (optional — common CLI shortcuts)
+
+This repo includes a [`Makefile`](Makefile) that wraps frequent commands (`db-up`, `migrate`, VN100 ETL, Phase 3/4 windows + S/R + train/embeddings, lint/tests, API, …).
+
+```bash
+make help
+```
+
+Quick examples:
+
+```bash
+make db-up
+make migrate
+make etl-backfill-vn100          # END defaults to "today" (via `uv run python`)
+make etl-backfill-vn100 END=2026-04-19
+make etl-incremental-vn100 END=2026-04-19
+make api
+```
+
+### Makefile — suggested order on a real DB (Phase 2 → 4, VN100)
+
+Assume `DATABASE_URL` is set (via `.env` or your shell), Postgres (TimescaleDB + pgvector) is running, and migrations are applied.
+
+1. **Bootstrap DB** — `make db-up` → `make migrate`
+2. **Phase 2 — load enough OHLCV history** — first run: `make etl-backfill-vn100` (override `START=`, `END=`, `CONCURRENCY=`, `RPM=` as needed). Later: `make etl-incremental-vn100 END=YYYY-MM-DD`.
+3. **Phase 3 — windows export + S/R metadata for hybrid context** — one shot (ordered: windows → S/R): `make phase3-vn100`. Or split: `make etl-generate-windows-vn100` then `make etl-detect-sr-vn100`. Per symbol: `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-symbol SYMBOL=VCB`. Optional date filters: `WIN_START=`, `WIN_END=`. Output dir: `WINDOWS_OUT=` (default `data/windows`). Optional (after many `detect-sr` runs): `make etl-purge-inactive-sr-vn100` or `make etl-purge-inactive-sr-all`, or `POST /api/sr-zones/purge-inactive`.
+4. **Phase 4 — encoder → `pattern_embeddings`** — smoke: `make ml-train-encoder-synthetic`. Heavier training from a TSV with a `time` column + OHLCV: `make ml-train-encoder OHLCV_TSV=path/to/export.tsv ML_ENCODER_EPOCHS=8`. Generate vectors + insert: `make ml-embed-vn100` (sequential over `TICKERS_VN100`) or `make ml-embed-symbol SYMBOL=VCB`. Tune `ML_EMBED_BATCH=`, `ML_DEVICE=` (or `TORCH_DEVICE`).
+5. **Optional: inspect HNSW / index sizes in `psql`** — e.g. `SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size FROM pg_stat_user_indexes WHERE relname = 'pattern_embeddings' ORDER BY indexname;`
+
+Run `make help` for the full target list.
+
+`make ml-embed-vn100` uses `grep` + a `while` read loop (POSIX / Git Bash). If your GNU Make defaults to `cmd.exe` as the recipe shell, use Git Bash or run `make ml-embed-symbol SYMBOL=...` per ticker.
+
+**Windows:** PowerShell often **does not ship with `make`**. Typical options are **Git Bash** (ships with Git for Windows) or installing GNU Make separately, then run `make ...` from that environment.
+
+For a PowerShell-friendly one-liner (avoids continuation pitfalls), run:
+
+```bash
+make windows-ps-backfill-vn100
 ```
 
 ### 1) Configure environment
@@ -393,6 +540,8 @@ python -m etl.pipeline incremental \
 
 ## Run Phase 3 (Feature Engineering & Preprocessing)
 
+Makefile equivalents: `make etl-generate-windows-vn100`, `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-vn100`, `make etl-detect-sr-symbol SYMBOL=VCB`, or `make phase3-vn100`; purge inactive rows: `make etl-purge-inactive-sr-vn100` / `make etl-purge-inactive-sr-all` (see **Makefile — suggested order** above).
+
 ### Generate sliding windows from OHLCV in DB
 
 Reads OHLCV from DB, forward-fills missing business days, creates [30 sessions × 5 OHLCV channels] windows, labels by T+5 return, z-score normalizes, and splits train/test chronologically (80/20).
@@ -429,12 +578,48 @@ python -m etl.pipeline detect-sr --symbols VCB FPT
 python -m etl.pipeline detect-sr --symbols-file etl/tickers_vn100.txt --order 5
 ```
 
+### Purge inactive S/R rows (`is_active = FALSE`)
+
+Each `detect-sr` run deactivates prior zones and inserts new ones, so inactive rows accumulate. To delete inactive rows permanently:
+
+```bash
+# Only symbols listed in a file (e.g. VN100)
+python -m etl.pipeline purge-inactive-sr --symbols-file etl/tickers_vn100.txt
+
+# Entire table (all symbols)
+python -m etl.pipeline purge-inactive-sr --all-inactive
+```
+
+Makefile: `make etl-purge-inactive-sr-vn100`, `make etl-purge-inactive-sr-all`.
+
+API (protect in production): `POST /api/sr-zones/purge-inactive` with JSON `{"symbols": ["VCB"]}` or `{"all_inactive": true}` (do not combine `symbols` with `all_inactive`).
+
 ### Tests / Lint / Type-check
 
 ```bash
 ruff check .
 mypy .
 pytest -q
+```
+
+## Run Phase 4 (ML & embeddings → `pattern_embeddings`)
+
+Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100`.
+
+**Train encoder (writes weights, default `ml/model_store/cnn_encoder.pt`):**
+
+```bash
+# Smoke (synthetic OHLCV)
+uv run python -m ml.train_pipeline --synthetic --epochs 1 --batch-size 32 --out ml/model_store/cnn_encoder.pt
+
+# From a TSV (must include `time` + OHLCV columns; see tests/fixtures/ohlcv_small.tsv)
+uv run python -m ml.train_pipeline --ohlcv-tsv path/to/ohlcv.tsv --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
+```
+
+**Generate embeddings and INSERT into Postgres (`--truncate-symbol` deletes prior rows for that symbol):**
+
+```bash
+uv run python -m ml.embedding_generator --symbol VCB --truncate-symbol --model ml/model_store/cnn_encoder.pt --batch-size 512
 ```
 
 ---
@@ -461,6 +646,7 @@ Open docs:
 - `GET /api/ohlcv/{symbol}/latest?n=...`
 - `GET /api/sr-zones/{symbol}?active_only=true|false`
 - `GET /api/sr-zones/{symbol}/distance?price=...`
+- `POST /api/sr-zones/purge-inactive` (delete S/R rows with `is_active=false`; see Phase 3 purge section)
 - `POST /api/rac/similar-patterns`
 - `POST /api/rac/context`
 - `POST /api/rac/full-context`
