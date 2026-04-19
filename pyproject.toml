@@ -34,3 +34,21 @@ warn_redundant_casts = true
 warn_unused_configs = true
 no_implicit_optional = true
 ignore_missing_imports = true
+
+# PyTorch CUDA wheels live on download.pytorch.org, not PyPI. Use a CUDA line that
+# matches your NVIDIA driver; cu128 ships torch 2.11+ for win32/cp312 (cu124 does not).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+]

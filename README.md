@@ -87,7 +87,8 @@ Giả sử `DATABASE_URL` đã đúng (`.env` hoặc export), TimescaleDB/pgvect
 
 4. **Phase 4 — encoder → `pattern_embeddings`**  
    - Smoke nhanh: `make ml-train-encoder-synthetic` (ghi `ML_ENCODER_OUT`, mặc định `ml/model_store/cnn_encoder.pt`).  
-   - Train “nghiêm” từ TSV OHLCV (cột `time` + OHLCV):  
+   - Train trực tiếp từ bảng **`stock_ohlcv`** (không cần file TSV): `make ml-train-encoder-db` (theo `TICKERS_VN100`) hoặc `make ml-train-encoder-db-symbol SYMBOL=VCB`; có thể lọc ngày `WIN_START=` / `WIN_END=` như bước export windows.  
+   - Hoặc train từ TSV OHLCV (cột `time` + OHLCV):  
      `make ml-train-encoder OHLCV_TSV=đường/dẫn/export.tsv ML_ENCODER_EPOCHS=8 ML_ENCODER_BATCH=256`  
    - Sinh embedding vào DB (xoá embedding cũ của mã rồi insert lại):  
      - Cả danh sách VN100 (tuần tự, dễ đo thời gian từng mã): `make ml-embed-vn100`  
@@ -297,13 +298,18 @@ pytest -q
 
 ## Chạy Phase 4 (ML & embeddings → `pattern_embeddings`)
 
-Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100` (thứ tự tổng thể nằm ở mục **Makefile — thứ tự** phía trên).
+Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-train-encoder-db`, `make ml-train-encoder-db-symbol SYMBOL=...`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100` (thứ tự tổng thể nằm ở mục **Makefile — thứ tự** phía trên).
 
 **Train encoder (tạo file weights, mặc định `ml/model_store/cnn_encoder.pt`):**
 
 ```bash
 # Smoke (OHLCV tổng hợp)
 uv run python -m ml.train_pipeline --synthetic --epochs 1 --batch-size 32 --out ml/model_store/cnn_encoder.pt
+
+# Từ Postgres (bảng stock_ohlcv; cần DATABASE_URL hoặc --database-url)
+uv run python -m ml.train_pipeline --from-db --symbols-file etl/tickers_vn100.txt --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
+# Một mã + lọc ngày:
+uv run python -m ml.train_pipeline --from-db --symbols VCB --start 2015-01-01 --end 2025-12-31 --epochs 8 --out ml/model_store/cnn_encoder.pt
 
 # Từ file TSV (cột time + OHLCV; xem fixture tests/fixtures/ohlcv_small.tsv)
 uv run python -m ml.train_pipeline --ohlcv-tsv path/to/ohlcv.tsv --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
@@ -421,7 +427,7 @@ Assume `DATABASE_URL` is set (via `.env` or your shell), Postgres (TimescaleDB +
 1. **Bootstrap DB** — `make db-up` → `make migrate`
 2. **Phase 2 — load enough OHLCV history** — first run: `make etl-backfill-vn100` (override `START=`, `END=`, `CONCURRENCY=`, `RPM=` as needed). Later: `make etl-incremental-vn100 END=YYYY-MM-DD`.
 3. **Phase 3 — windows export + S/R metadata for hybrid context** — one shot (ordered: windows → S/R): `make phase3-vn100`. Or split: `make etl-generate-windows-vn100` then `make etl-detect-sr-vn100`. Per symbol: `make etl-generate-windows-symbol SYMBOL=VCB`, `make etl-detect-sr-symbol SYMBOL=VCB`. Optional date filters: `WIN_START=`, `WIN_END=`. Output dir: `WINDOWS_OUT=` (default `data/windows`). Optional (after many `detect-sr` runs): `make etl-purge-inactive-sr-vn100` or `make etl-purge-inactive-sr-all`, or `POST /api/sr-zones/purge-inactive`.
-4. **Phase 4 — encoder → `pattern_embeddings`** — smoke: `make ml-train-encoder-synthetic`. Heavier training from a TSV with a `time` column + OHLCV: `make ml-train-encoder OHLCV_TSV=path/to/export.tsv ML_ENCODER_EPOCHS=8`. Generate vectors + insert: `make ml-embed-vn100` (sequential over `TICKERS_VN100`) or `make ml-embed-symbol SYMBOL=VCB`. Tune `ML_EMBED_BATCH=`, `ML_DEVICE=` (or `TORCH_DEVICE`).
+4. **Phase 4 — encoder → `pattern_embeddings`** — smoke: `make ml-train-encoder-synthetic`. Train straight from **`stock_ohlcv`**: `make ml-train-encoder-db` or `make ml-train-encoder-db-symbol SYMBOL=VCB` (optional `WIN_START=` / `WIN_END=`). Or train from a TSV: `make ml-train-encoder OHLCV_TSV=path/to/export.tsv ML_ENCODER_EPOCHS=8`. Generate vectors + insert: `make ml-embed-vn100` (sequential over `TICKERS_VN100`) or `make ml-embed-symbol SYMBOL=VCB`. Tune `ML_EMBED_BATCH=`, `ML_DEVICE=` (or `TORCH_DEVICE`).
 5. **Optional: inspect HNSW / index sizes in `psql`** — e.g. `SELECT indexname, pg_size_pretty(pg_relation_size(indexrelid::regclass)) AS index_size FROM pg_stat_user_indexes WHERE relname = 'pattern_embeddings' ORDER BY indexname;`
 
 Run `make help` for the full target list.
@@ -604,13 +610,18 @@ pytest -q
 
 ## Run Phase 4 (ML & embeddings → `pattern_embeddings`)
 
-Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100`.
+Makefile: `make ml-train-encoder-synthetic`, `make ml-train-encoder`, `make ml-train-encoder-db`, `make ml-train-encoder-db-symbol SYMBOL=...`, `make ml-embed-symbol SYMBOL=...`, `make ml-embed-vn100`.
 
 **Train encoder (writes weights, default `ml/model_store/cnn_encoder.pt`):**
 
 ```bash
 # Smoke (synthetic OHLCV)
 uv run python -m ml.train_pipeline --synthetic --epochs 1 --batch-size 32 --out ml/model_store/cnn_encoder.pt
+
+# From Postgres (stock_ohlcv; needs DATABASE_URL or --database-url)
+uv run python -m ml.train_pipeline --from-db --symbols-file etl/tickers_vn100.txt --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
+# Single symbol + date filter:
+uv run python -m ml.train_pipeline --from-db --symbols VCB --start 2015-01-01 --end 2025-12-31 --epochs 8 --out ml/model_store/cnn_encoder.pt
 
 # From a TSV (must include `time` + OHLCV columns; see tests/fixtures/ohlcv_small.tsv)
 uv run python -m ml.train_pipeline --ohlcv-tsv path/to/ohlcv.tsv --epochs 8 --batch-size 256 --out ml/model_store/cnn_encoder.pt
