@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from etl.feature_engineer import OHLCV_CHANNELS, WINDOW_SIZE, forward_fill_trading_days, zscore_normalize_window
+from etl.feature_engineer import (
+    FEATURE_CHANNELS,
+    WINDOW_SIZE,
+    forward_fill_trading_days,
+    zscore_normalize_window,
+)
 from ml.cnn_encoder import encode_batch
 from ml.embedding_generator import load_encoder
 
@@ -31,15 +36,26 @@ def _normalize_window_end(window_end: datetime) -> pd.Timestamp:
 def build_normalized_query_window(
     df: pd.DataFrame,
     window_end: datetime,
+    *,
+    channels: list[str] | tuple[str, ...] = tuple(FEATURE_CHANNELS),
 ) -> tuple[np.ndarray, datetime, datetime, pd.DataFrame]:
-    """Return (normalized_window [30,5], window_start, window_end, raw_ohlcv_slice DataFrame)."""
+    """Return ``(normalized_window [T, C], window_start, window_end, raw_ohlcv_slice DataFrame)``.
+
+    By default includes the ``close_ret`` channel so the produced window
+    matches what the encoder expects. Pass ``channels=OHLCV_CHANNELS`` only
+    for backwards-compat with the legacy 5-channel encoder.
+    """
     if df.empty:
         raise ValueError("no OHLCV rows for symbol")
 
     df = forward_fill_trading_days(df)
     df = df.sort_values("time").reset_index(drop=True)
-    target = _normalize_window_end(window_end)
+    channel_list = list(channels)
+    if "close_ret" in channel_list and "close_ret" not in df.columns:
+        cr = df["close"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        df = df.assign(close_ret=cr)
 
+    target = _normalize_window_end(window_end)
     match = df.index[df["time"] == target].tolist()
     if match:
         i = int(match[-1])
@@ -54,12 +70,14 @@ def build_normalized_query_window(
 
     start_i = i - (WINDOW_SIZE - 1)
     slice_df = df.loc[start_i:i].copy()
-    raw = slice_df[list(OHLCV_CHANNELS)].to_numpy(dtype=np.float64)
+    raw = slice_df[channel_list].to_numpy(dtype=np.float64)
     normed = zscore_normalize_window(raw)
     w_start = slice_df["time"].iloc[0].to_pydatetime()
     w_end = slice_df["time"].iloc[-1].to_pydatetime()
-    out_cols = ["time", *OHLCV_CHANNELS]
-    return normed, w_start, w_end, slice_df[out_cols]
+    # Keep the raw OHLCV slice (without close_ret) for visualization callers.
+    display_cols = ["time", "open", "high", "low", "close", "volume"]
+    present_cols = [c for c in display_cols if c in slice_df.columns]
+    return normed, w_start, w_end, slice_df[present_cols]
 
 
 def embedding_from_normalized_window(

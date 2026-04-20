@@ -37,8 +37,16 @@ SR_ORDER ?= 5
 # Phase 4: encoder + embeddings
 ML_ENCODER_OUT ?= ml/model_store/cnn_encoder.pt
 OHLCV_TSV ?= tests/fixtures/ohlcv_small.tsv
-ML_ENCODER_EPOCHS ?= 8
-ML_ENCODER_BATCH ?= 256
+# DB-scale training defaults (VN100 / full history): retrieval-first SupCon profile
+ML_ENCODER_EPOCHS ?= 60
+ML_ENCODER_BATCH ?= 512
+ML_LR ?= 0.0003
+ML_LOSS ?= supcon
+ML_SUPCON_TEMP ?= 0.2
+ML_SUPCON_CE ?= 0.2
+ML_ES_PATIENCE ?= 15
+# Small TSV smoke training (fixture): keep fast defaults separate from DB training
+ML_TSV_TRAIN_EPOCHS ?= 8
 ML_DEVICE ?= cpu
 ML_EMBED_BATCH ?= 512
 
@@ -104,7 +112,7 @@ help:
 	@echo "  make etl-backfill-vn100 END=2026-04-19"
 	@echo "  make etl-incremental-vn100 END=2026-04-19 CONCURRENCY=2 RPM=55"
 	@echo "  make etl-generate-windows-vn100 WIN_START=2015-01-01 WIN_END=2025-12-31"
-	@echo "  make ml-train-encoder ML_ENCODER_EPOCHS=12 OHLCV_TSV=path/to/export.tsv"
+	@echo "  make ml-train-encoder ML_TSV_TRAIN_EPOCHS=12 OHLCV_TSV=path/to/export.tsv"
 	@echo "  make ml-train-encoder-db WIN_START=2015-01-01 WIN_END=2025-12-31"
 	@echo "  make ml-embed-vn100 ML_EMBED_BATCH=256"
 	@echo "  make bench-hnsw-vs-seqscan BENCH_K=20 BENCH_N_QUERIES=50 BENCH_SEED=1"
@@ -240,8 +248,13 @@ ml-train-encoder-synthetic:
 ml-train-encoder:
 	$(PY) -m ml.train_pipeline \
 		--ohlcv-tsv $(OHLCV_TSV) \
-		--epochs $(ML_ENCODER_EPOCHS) \
+		--epochs $(ML_TSV_TRAIN_EPOCHS) \
 		--batch-size $(ML_ENCODER_BATCH) \
+		--lr $(ML_LR) \
+		--loss $(ML_LOSS) \
+		--supcon-temperature $(ML_SUPCON_TEMP) \
+		--supcon-ce-weight $(ML_SUPCON_CE) \
+		--early-stop-patience $(ML_ES_PATIENCE) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 
@@ -252,6 +265,11 @@ ml-train-encoder-db:
 		--symbols-file $(TICKERS_VN100) \
 		--epochs $(ML_ENCODER_EPOCHS) \
 		--batch-size $(ML_ENCODER_BATCH) \
+		--lr $(ML_LR) \
+		--loss $(ML_LOSS) \
+		--supcon-temperature $(ML_SUPCON_TEMP) \
+		--supcon-ce-weight $(ML_SUPCON_CE) \
+		--early-stop-patience $(ML_ES_PATIENCE) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 
@@ -262,6 +280,11 @@ ml-train-encoder-db-symbol: _require-symbol
 		--symbols $(SYMBOL) \
 		--epochs $(ML_ENCODER_EPOCHS) \
 		--batch-size $(ML_ENCODER_BATCH) \
+		--lr $(ML_LR) \
+		--loss $(ML_LOSS) \
+		--supcon-temperature $(ML_SUPCON_TEMP) \
+		--supcon-ce-weight $(ML_SUPCON_CE) \
+		--early-stop-patience $(ML_ES_PATIENCE) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 
@@ -287,11 +310,38 @@ ml-embed-vn100:
 			--device $(ML_DEVICE) || exit 1; \
 	done
 
+# PowerShell-friendly VN100 embedding loop (Windows)
+.PHONY: windows-ps-embed-vn100
+windows-ps-embed-vn100:
+	@echo "Runs embedding loop in PowerShell (Windows)."
+	@powershell -NoProfile -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='Stop'; $$tickers = Get-Content '$(TICKERS_VN100)' | ForEach-Object { $$_.Trim() } | Where-Object { $$_.Length -gt 0 -and -not $$_.StartsWith('#') }; foreach ($$sym in $$tickers) { Write-Host ('== embedding ' + $$sym + ' =='); $(UV) run python -m ml.embedding_generator --symbol $$sym --truncate-symbol --model '$(ML_ENCODER_OUT)' --batch-size $(ML_EMBED_BATCH) --device $(ML_DEVICE) }"
+
 .PHONY: _require-symbol
 _require-symbol:
 ifeq ($(strip $(SYMBOL)),)
 	$(error SYMBOL is required (example: make ml-embed-symbol SYMBOL=VCB))
 endif
+
+# Phase 4.5: encoder diagnostics (P@k theo lớp + PCA 2D)
+DIAG_K ?= 20
+DIAG_N_QUERIES ?= 2000
+DIAG_LEAKAGE_DAYS ?= 45
+DIAG_PCA_PER_LABEL ?= 3000
+DIAG_OUT ?= ml/diagnostics
+
+.PHONY: ml-diag-encoder
+ml-diag-encoder:
+	$(PY) -m ml.encoder_diagnostics \
+		--symbols-file $(TICKERS_VN100) \
+		--encoder $(ML_ENCODER_OUT) \
+		$(WIN_DATE_FLAGS) \
+		--train-ratio $(TRAIN_RATIO) \
+		--k $(DIAG_K) \
+		--n-queries $(DIAG_N_QUERIES) \
+		--leakage-days $(DIAG_LEAKAGE_DAYS) \
+		--pca-per-label $(DIAG_PCA_PER_LABEL) \
+		--device $(ML_DEVICE) \
+		--out-dir $(DIAG_OUT)
 
 .PHONY: bench-smoke
 bench-smoke:

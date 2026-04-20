@@ -19,7 +19,7 @@ import psycopg
 import torch
 
 from etl.feature_engineer import WindowRecord, generate_windows
-from ml.cnn_encoder import CNNEncoder, EncoderConfig, encode_batch
+from ml.cnn_encoder import CNNEncoder, EncoderConfig, LegacyCNNEncoder, LegacyEncoderConfig, encode_batch
 
 
 @dataclass(frozen=True)
@@ -45,12 +45,23 @@ def _format_vector(vec: np.ndarray) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec.tolist()) + "]"
 
 
-def load_encoder(model_path: Path) -> CNNEncoder:
+def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder:
     payload = torch.load(model_path, map_location="cpu")
-    cfg_dict = payload.get("config", {})
-    cfg = EncoderConfig(**cfg_dict) if cfg_dict else EncoderConfig()
-    model = CNNEncoder(cfg)
-    model.load_state_dict(payload["state_dict"])
+    state_dict = payload.get("state_dict", {})
+    cfg_dict = payload.get("config", {}) if isinstance(payload, dict) else {}
+
+    # Legacy checkpoints (v1) have state dict keys like "net.0.weight".
+    # New checkpoints have keys like "backbone.0.weight" and include config with n_channels=6.
+    keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
+    is_legacy = any(k.startswith("net.") for k in keys) and not any(k.startswith("backbone.") for k in keys)
+    if is_legacy:
+        legacy_cfg = LegacyEncoderConfig(**cfg_dict) if cfg_dict else LegacyEncoderConfig()
+        model = LegacyCNNEncoder(legacy_cfg)
+        model.load_state_dict(state_dict)
+    else:
+        cfg = EncoderConfig(**cfg_dict) if cfg_dict else EncoderConfig()
+        model = CNNEncoder(cfg)
+        model.load_state_dict(state_dict)
     model.eval()
     return model
 
@@ -159,8 +170,16 @@ def generate_and_insert(
 
         df = fetch_ohlcv(conn, symbol=symbol, start=start, end=end)
         records = generate_windows(df)
-        windows = np.stack([r.data for r in records], axis=0) if records else np.zeros((0, 30, 5), np.float32)
-        embeddings = encode_batch(model, windows, device=device, batch_size=batch_size) if len(records) else np.zeros((0, 128), np.float32)
+        windows = (
+            np.stack([r.data for r in records], axis=0)
+            if records
+            else np.zeros((0, 30, int(model.cfg.n_channels)), np.float32)
+        )
+        embeddings = (
+            encode_batch(model, windows, device=device, batch_size=batch_size)
+            if len(records)
+            else np.zeros((0, 128), np.float32)
+        )
         inserted = insert_embeddings(conn, records=records, embeddings=embeddings) if len(records) else 0
         hnsw: bool | None = None
         if inserted > 0:

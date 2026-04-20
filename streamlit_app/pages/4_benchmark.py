@@ -2,27 +2,24 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-_repo = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
-if str(_repo) not in sys.path:
-    sys.path.insert(0, str(_repo))
+_REPO = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-import httpx
 import plotly.graph_objects as go
 import streamlit as st
+
+from streamlit_app.common import api_base_url_input, http_client
 
 st.set_page_config(page_title="Benchmark", layout="wide")
 st.title("Benchmark")
 
-api = st.sidebar.text_input(
-    "API base URL",
-    value=os.environ.get("API_BASE_URL", "http://127.0.0.1:8000"),
-).rstrip("/")
+api = api_base_url_input()
 
-with httpx.Client(base_url=api, timeout=120.0) as client:
+with http_client(api) as client:
     stats = client.get("/api/benchmark/stats")
     if stats.status_code == 200:
         sj = stats.json()
@@ -33,9 +30,7 @@ with httpx.Client(base_url=api, timeout=120.0) as client:
             st.info(sj.get("hint", "pg_stat_statements unavailable"))
 
     lst = client.get("/api/benchmark/results")
-    names = []
-    if lst.status_code == 200:
-        names = [x["name"] for x in lst.json()]
+    names = [x["name"] for x in lst.json()] if lst.status_code == 200 else []
 
     choice = st.selectbox("Result JSON", names) if names else None
     payload = None
@@ -47,9 +42,8 @@ with httpx.Client(base_url=api, timeout=120.0) as client:
     st.subheader("EXPLAIN (whitelisted)")
     qk = st.selectbox("query_kind", ["hnsw_knn", "seqscan_knn", "hybrid_context"])
     kk = st.number_input("k", 1, 200, 20)
-    ex_btn = st.button("Run EXPLAIN")
     plan_text = ""
-    if ex_btn:
+    if st.button("Run EXPLAIN"):
         er = client.post("/api/benchmark/explain", json={"query_kind": qk, "k": int(kk)})
         if er.status_code == 200:
             plan_text = er.json().get("plan_text", "")

@@ -66,19 +66,19 @@ def _engine() -> sa.Engine:
 
 class TestZscoreNormalize:
     def test_output_shape(self) -> None:
-        w = np.random.default_rng(0).normal(size=(30, 5))
+        w = np.random.default_rng(0).normal(size=(30, 6))
         normed = zscore_normalize_window(w)
-        assert normed.shape == (30, 5)
+        assert normed.shape == (30, 6)
 
     def test_mean_near_zero(self) -> None:
-        w = np.random.default_rng(1).normal(loc=50, scale=10, size=(30, 5))
+        w = np.random.default_rng(1).normal(loc=50, scale=10, size=(30, 6))
         normed = zscore_normalize_window(w)
         np.testing.assert_allclose(normed.mean(axis=0), 0.0, atol=1e-10)
 
     def test_constant_channel_zeroed(self) -> None:
-        w = np.ones((30, 5))
+        w = np.ones((30, 6))
         normed = zscore_normalize_window(w)
-        np.testing.assert_array_equal(normed, np.zeros((30, 5)))
+        np.testing.assert_array_equal(normed, np.zeros((30, 6)))
 
 
 class TestForwardFill:
@@ -127,7 +127,7 @@ class TestGenerateWindows:
         assert len(records) == 16
         for r in records:
             assert r.symbol == "VCB"
-            assert r.data.shape == (30, 5)
+            assert r.data.shape == (30, 6)
             assert r.label in (0, 1, 2)
 
     def test_stride_reduces_count(self) -> None:

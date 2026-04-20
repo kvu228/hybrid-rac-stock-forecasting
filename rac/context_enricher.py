@@ -49,6 +49,9 @@ async def compute_rac_context(
     query_embedding: list[float],
     k: int = 20,
 ) -> RacContext:
+    # Ensure HNSW returns at least k neighbors deterministically.
+    # Some configurations can return fewer than k when ef_search is too low.
+    await conn.execute("SELECT set_config('hnsw.ef_search', %(v)s, true);", {"v": str(max(int(k), 100))})
     qv = _format_vector(query_embedding)
     row = await (
         await conn.execute(
@@ -81,6 +84,7 @@ async def _fetch_knn_label_distances(
     """Top-``k`` neighbors by cosine distance (same ordering as ``compute_full_rac_context`` KNN)."""
     if k <= 0:
         return []
+    await conn.execute("SELECT set_config('hnsw.ef_search', %(v)s, true);", {"v": str(max(int(k), 100))})
     qv = _format_vector(query_embedding)
     cur = await conn.execute(
         """
@@ -107,6 +111,7 @@ async def compute_full_rac_context(
     current_price: float,
     k: int = 20,
 ) -> FullRacContext:
+    await conn.execute("SELECT set_config('hnsw.ef_search', %(v)s, true);", {"v": str(max(int(k), 100))})
     qv = _format_vector(query_embedding)
     row = await (
         await conn.execute(

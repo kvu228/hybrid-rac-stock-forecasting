@@ -2,118 +2,50 @@
 
 from __future__ import annotations
 
-import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
-_repo = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
-if str(_repo) not in sys.path:
-    sys.path.insert(0, str(_repo))
+_REPO = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-import httpx
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from streamlit_app.session_window import (
-    end_index_for_calendar_day,
-    start_index_from_end_index,
-    window_end_date_bounds,
+from streamlit_app.common import (
+    api_base_url_input,
+    hist_sessions_slider,
+    http_client,
+    label_text,
+    pick_30_session_window,
+    pick_symbol,
+    render_label_pie,
 )
-
-_LABEL_NAMES: dict[int, str] = {0: "Down", 1: "Neutral", 2: "Up"}
-
-
-def _label_text(value: object) -> str:
-    if value is None:
-        return "—"
-    try:
-        key = int(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return _LABEL_NAMES.get(key, str(key))
-
-
-def _rac_pie_counts(label_distribution: dict[str, object]) -> dict[str, float]:
-    return {_label_text(k): float(v) for k, v in label_distribution.items()}
-
-
-def _rac_pie_weighted(neighbor_rows: list[dict[str, object]], *, eps: float = 0.02) -> dict[str, float]:
-    acc: dict[str, float] = {}
-    for r in neighbor_rows:
-        d = float(r.get("cosine_distance", 0.0))
-        w = 1.0 / (max(d, 0.0) + eps)
-        lab = _label_text(r.get("label"))
-        acc[lab] = acc.get(lab, 0.0) + w
-    return acc
 
 
 st.set_page_config(page_title="RAC prediction", layout="wide")
 st.title("RAC prediction (hybrid context)")
 
-api = st.sidebar.text_input(
-    "API base URL",
-    value=os.environ.get("API_BASE_URL", "http://127.0.0.1:8000"),
-).rstrip("/")
+api = api_base_url_input()
 k = st.sidebar.slider("K neighbors", 5, 50, 20)
-hist_sessions = st.sidebar.slider(
-    "Lịch sử tải (phiên)",
-    min_value=60,
-    max_value=5000,
-    value=480,
-    step=40,
-    help="Số nến gần nhất để chọn cửa sổ 30 phiên (kéo sâu về quá khứ).",
+hist_sessions = hist_sessions_slider(
+    help_text="Số nến gần nhất để chọn cửa sổ 30 phiên (kéo sâu về quá khứ).",
 )
 
-with httpx.Client(base_url=api, timeout=120.0) as client:
-    sym_resp = client.get("/api/symbols")
-    if sym_resp.status_code != 200:
-        st.error(sym_resp.text)
-        st.stop()
-    symbols = [r["symbol"] for r in sym_resp.json()]
-    if not symbols:
-        st.warning("No symbols.")
-        st.stop()
-    symbol = st.selectbox("Symbol", symbols)
-
-    latest = client.get(f"/api/ohlcv/{symbol}/latest", params={"n": int(hist_sessions)})
-    if latest.status_code != 200:
-        st.error(latest.text)
-        st.stop()
-    bars = latest.json()
-    if len(bars) < 30:
-        st.warning("Need at least 30 sessions.")
-        st.stop()
-    times = [datetime.fromisoformat(str(b["time"]).replace("Z", "+00:00")) for b in bars]
-    st.sidebar.caption(
-        f"Dữ liệu đã tải: **{times[0].strftime('%Y-%m-%d')}** → **{times[-1].strftime('%Y-%m-%d')}** "
-        f"({len(times)} phiên, UTC)"
+with http_client(api) as client:
+    symbol = pick_symbol(client)
+    window = pick_30_session_window(
+        client,
+        symbol,
+        hist_sessions,
+        end_caption_fmt="Đủ 30 phiên: **{start}** UTC → **{end}** UTC",
     )
-
-    min_end_d, max_end_d = window_end_date_bounds(times)
-    end_pick = st.date_input(
-        "Ngày kết thúc cửa sổ (30 phiên)",
-        value=max_end_d,
-        min_value=min_end_d,
-        max_value=max_end_d,
-        help="Ngày theo lịch của **phiên cuối** trong 30 phiên (UTC). Không có phiên đúng ngày thì lấy phiên gần nhất trước đó.",
-    )
-    j_end = end_index_for_calendar_day(times, end_pick)
-    start_i = start_index_from_end_index(j_end)
-    c_a, c_b = st.columns(2)
-    c_a.metric("Phiên đầu window", times[start_i].strftime("%Y-%m-%d"))
-    c_b.metric("Phiên cuối window", times[start_i + 29].strftime("%Y-%m-%d"))
-    st.caption(
-        f"Đủ 30 phiên: **{times[start_i].strftime('%Y-%m-%d %H:%M')}** UTC → "
-        f"**{times[start_i + 29].strftime('%Y-%m-%d %H:%M')}** UTC"
-    )
-    window_end = times[start_i + 29]
-    current_price = float(bars[start_i + 29]["close"])
+    assert window is not None
+    current_price = window.current_price
 
     qe = client.post(
         "/api/rac/query-embedding",
-        json={"symbol": symbol, "window_end": window_end.isoformat()},
+        json={"symbol": symbol, "window_end": window.window_end.isoformat()},
     )
     if qe.status_code != 200:
         st.error(qe.text)
@@ -135,49 +67,32 @@ with httpx.Client(base_url=api, timeout=120.0) as client:
         st.stop()
     ctx = fc.json()
 
-ws_api = qemb.get("window_start")
-we_api = qemb.get("window_end")
-st.caption(f"Cửa sổ embedding (API): **{ws_api}** … **{we_api}** — giá đóng cuối window dùng cho hybrid: **{current_price:.4f}**")
+st.caption(
+    f"Cửa sổ embedding (API): **{qemb.get('window_start')}** … **{qemb.get('window_end')}** — "
+    f"giá đóng cuối window dùng cho hybrid: **{current_price:.4f}**"
+)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Neighbors", ctx.get("total_neighbors", 0))
 c2.metric("Avg cosine dist", f"{ctx.get('avg_cosine_dist') or 0:.4f}")
-c3.metric("Dominant label", _label_text(ctx.get("dominant_label")))
+c3.metric("Dominant label", label_text(ctx.get("dominant_label")))
 c4.metric("KNN confidence", f"{(ctx.get('knn_confidence') or 0) * 100:.1f}%")
 
 ld = ctx.get("label_distribution") or {}
 nld = ctx.get("neighbor_label_distances") or []
 if ld or nld:
-    pie_mode = st.radio(
-        "Phân bố nhãn (pie)",
-        options=("count", "weighted"),
-        format_func=lambda m: (
-            "Đếm đều — theo label_distribution (DB)"
-            if m == "count"
-            else "Trọng số theo cos distance — cùng tập KNN với full-context"
+    render_label_pie(
+        neighbors=nld,
+        count_distribution=ld,
+        count_mode_label="Đếm đều — theo label_distribution (DB)",
+        weighted_mode_label="Trọng số theo cos distance — cùng tập KNN với full-context",
+        weighted_title="Label distribution (KNN, trọng số 1/(cos_dist+0.02))",
+        weighted_caption=(
+            "Cùng embedding + **k** với bảng metrics; trọng số ưu tiên láng giềng có vector "
+            "**gần query** hơn."
         ),
-        horizontal=True,
-        help="Weighted dùng `neighbor_label_distances` từ API (w = 1/(dist+0.02)), khớp thứ tự KNN.",
+        radio_help="Weighted dùng `neighbor_label_distances` từ API (w = 1/(dist+0.02)), khớp thứ tự KNN.",
     )
-    if pie_mode == "weighted" and nld:
-        pie_values = _rac_pie_weighted(nld)
-        pie_title = "Label distribution (KNN, trọng số 1/(cos_dist+0.02))"
-    else:
-        pie_values = _rac_pie_counts(ld) if ld else {}
-        pie_title = "Label distribution (neighbors, đếm đều)"
-    if pie_values:
-        st.plotly_chart(
-            px.pie(
-                names=list(pie_values.keys()),
-                values=list(pie_values.values()),
-                title=pie_title,
-            ),
-            use_container_width=True,
-        )
-        if pie_mode == "weighted" and nld:
-            st.caption(
-                "Cùng embedding + **k** với bảng metrics; trọng số ưu tiên láng giềng có vector **gần query** hơn."
-            )
 
 st.subheader("Support / Resistance (hybrid)")
 ds = ctx.get("dist_to_support")
@@ -237,9 +152,8 @@ with st.expander("Chú thích: Evidence / neighbor_ids là gì?", expanded=False
         """
     )
 
-pred = st.button("Run predict (persist)")
-if pred:
-    with httpx.Client(base_url=api, timeout=120.0) as client:
+if st.button("Run predict (persist)"):
+    with http_client(api) as client:
         pr = client.post(
             "/api/rac/predict",
             params={"persist": "true"},
@@ -252,9 +166,8 @@ if pred:
         )
         if pr.status_code == 200:
             pj = pr.json()
-            pl = _label_text(pj.get("predicted_label"))
             st.success(
-                f"**{pl}** (raw {pj.get('predicted_label')!r}), "
+                f"**{label_text(pj.get('predicted_label'))}** (raw {pj.get('predicted_label')!r}), "
                 f"confidence {pj.get('confidence_score')!s}"
             )
             with st.expander("Raw JSON"):
