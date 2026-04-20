@@ -15,11 +15,6 @@ def _minmax_01(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
-def overlay_figure(close_series: list[np.ndarray], labels: list[str], *, title: str = "") -> go.Figure:
-    """One subplot per series (shared x): easier to read than a single crowded overlay."""
-    return close_curves_faceted(close_series, labels, title=title or "Close shape (min–max per series)")
-
-
 def close_curves_faceted(
     close_series: list[np.ndarray],
     labels: list[str],

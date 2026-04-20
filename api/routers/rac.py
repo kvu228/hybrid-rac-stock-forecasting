@@ -30,6 +30,8 @@ from api.schemas import (
     RacSimilarPatternsRequest,
     RacSimilarPatternsResponse,
 )
+from etl.feature_engineer import FEATURE_CHANNELS, OHLCV_CHANNELS
+from ml.embedding_generator import load_encoder
 from rac.context_enricher import FullRacContext, compute_full_rac_context, compute_rac_context
 from rac.query_window import (
     build_normalized_query_window,
@@ -73,6 +75,10 @@ async def rac_query_embedding(conn: DbConn, req: RacQueryEmbeddingRequest) -> di
         )
 
     symbol = req.symbol.strip().upper()
+    # Load encoder to determine expected channel count. This keeps the endpoint
+    # compatible with both legacy (5-channel) and new (6-channel) encoders.
+    encoder = load_encoder(model_path)
+    channels = tuple(FEATURE_CHANNELS) if int(encoder.cfg.n_channels) == 6 else tuple(OHLCV_CHANNELS)
     cur = await conn.execute(
         """
         SELECT time, symbol, open, high, low, close, volume
@@ -86,7 +92,7 @@ async def rac_query_embedding(conn: DbConn, req: RacQueryEmbeddingRequest) -> di
     rows = list(reversed(await cur.fetchall()))
     df = ohlcv_rows_to_dataframe(rows)
     try:
-        normed, w_start, w_end, slice_df = build_normalized_query_window(df, req.window_end)
+        normed, w_start, w_end, slice_df = build_normalized_query_window(df, req.window_end, channels=channels)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 

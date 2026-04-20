@@ -46,6 +46,9 @@ ml/model_store/
 reports/
 benchmark/results/
 
+# Local ML diagnostics outputs (plots/metrics from encoder_diagnostics)
+ml/diagnostics/
+
 
 # OS / IDE
 .DS_Store
