@@ -211,8 +211,19 @@ class PKBatchSampler(Sampler[list[int]]):
         self._batches_per_epoch = max(1, int(len(self.labels) / (self.classes_per_batch * self.samples_per_class)))
 
     def __iter__(self):
+        # Cycle classes evenly: iterate through a shuffled class list, taking
+        # ``classes_per_batch`` classes each batch. When exhausted, reshuffle.
+        class_list = self._classes.copy()
+        self._rng.shuffle(class_list)
+        ptr = 0
+
         for _ in range(self._batches_per_epoch):
-            chosen = self._rng.choice(self._classes, size=self.classes_per_batch, replace=False)
+            if ptr + self.classes_per_batch > class_list.size:
+                self._rng.shuffle(class_list)
+                ptr = 0
+            chosen = class_list[ptr : ptr + self.classes_per_batch]
+            ptr += self.classes_per_batch
+
             batch: list[int] = []
             for c in chosen:
                 pool = self._indices_by_class[int(c)]
@@ -543,14 +554,11 @@ def train_from_ohlcv(
         }
         return encoder, metrics
 
-    # Class weights for CE (both as main loss and as SupCon auxiliary).
-    classes, counts = np.unique(y_train, return_counts=True)
-    class_weights = np.zeros(3, dtype=np.float32)
-    for c, n in zip(classes, counts, strict=True):
-        class_weights[int(c)] = float(len(y_train)) / (3.0 * float(n))
-    cw_tensor = torch.from_numpy(class_weights).to(torch.float32)
-
-    encoder, train_metrics = _train_encoder(train_loader, test_loader, encoder, train_cfg, class_weights=cw_tensor)
+    # We use PKBatchSampler which forces exactly equal representation in every batch.
+    # Therefore, the CE loss should NOT use class_weights to penalize majority classes,
+    # as the batch itself is already perfectly balanced (e.g. 170 Down, 170 Neutral, 170 Up).
+    # Using class_weights on top of a balanced sampler causes massive under-prediction of majority classes.
+    encoder, train_metrics = _train_encoder(train_loader, test_loader, encoder, train_cfg, class_weights=None)
     metrics = {
         "train_windows": float(len(train_ds)),
         "test_windows": float(len(test_ds)) if test_ds is not None else 0.0,

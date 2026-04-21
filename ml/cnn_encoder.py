@@ -102,13 +102,21 @@ class CNNEncoder(nn.Module):
         c1, c2, c3 = cfg.conv_channels
         k = cfg.kernel_size
 
+        # Use dilated convolutions to increase receptive field over the 30-day window
+        p1 = 1 * (k - 1) // 2
+        p2 = 2 * (k - 1) // 2
+        p3 = 4 * (k - 1) // 2
+
         # Conv1d expects (B, channels, time); we transpose in forward().
         self.backbone = nn.Sequential(
-            nn.Conv1d(cfg.n_channels, c1, kernel_size=k, padding=k // 2),
+            nn.Conv1d(cfg.n_channels, c1, kernel_size=k, padding=p1, dilation=1),
+            nn.BatchNorm1d(c1),
             nn.GELU(),
-            nn.Conv1d(c1, c2, kernel_size=k, padding=k // 2),
+            nn.Conv1d(c1, c2, kernel_size=k, padding=p2, dilation=2),
+            nn.BatchNorm1d(c2),
             nn.GELU(),
-            nn.Conv1d(c2, c3, kernel_size=k, padding=k // 2),
+            nn.Conv1d(c2, c3, kernel_size=k, padding=p3, dilation=4),
+            nn.BatchNorm1d(c3),
             nn.GELU(),
         )
 
@@ -116,8 +124,20 @@ class CNNEncoder(nn.Module):
             pe = _build_sinusoidal_pe(cfg.window_size, c3)
             # Registered buffer so it moves with .to(device) but isn't trained.
             self.register_buffer("pos_encoding", pe, persistent=False)
+            self.pe_scale = nn.Parameter(torch.tensor(0.02))
         else:
             self.pos_encoding = None  # type: ignore[assignment]
+            self.pe_scale = None
+
+        # Self-attention layer to let sequence elements interact before pooling
+        self.self_attn = nn.TransformerEncoderLayer(
+            d_model=c3,
+            nhead=cfg.attn_heads,
+            dim_feedforward=c3 * 2,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+        )
 
         # Learnable query token that attends over time to pool a single vector.
         self.pool_query = nn.Parameter(torch.randn(1, 1, c3) * 0.02)
@@ -150,7 +170,10 @@ class CNNEncoder(nn.Module):
         feats = feats.transpose(1, 2)  # (B, T, c3) for attention
 
         if self.pos_encoding is not None:
-            feats = feats + self.pos_encoding.unsqueeze(0)
+            feats = feats + self.pos_encoding.unsqueeze(0) * self.pe_scale
+
+        # Allow all days to interact and form complex patterns
+        feats = self.self_attn(feats)
 
         query = self.pool_query.expand(b, -1, -1)  # (B, 1, c3)
         pooled, _ = self.attn(query, feats, feats, need_weights=False)  # (B, 1, c3)
