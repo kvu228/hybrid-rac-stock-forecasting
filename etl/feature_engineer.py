@@ -68,23 +68,61 @@ def relative_returns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def zscore_normalize_window(window: np.ndarray) -> np.ndarray:
-    """Z-score normalize each channel (column) independently within a window.
+def zscore_normalize_window(window: np.ndarray, channel_names: list[str] | None = None) -> np.ndarray:
+    """Normalize channels within a window.
+
+    Price columns (OHLC) are converted to percentage changes relative to the
+    first 'open' price in the window, scaled by 100. This preserves both shape
+    and ABSOLUTE volatility (e.g. 2.0 = +2% move).
+    Volume is z-scored. 'close_ret' is scaled by 100.
 
     Args:
         window: shape (WINDOW_SIZE, n_channels)
+        channel_names: List of channel names.
 
     Returns:
-        Normalized array of the same shape.  Constant channels (std=0) are
-        zeroed out.
+        Normalized array of the same shape.
     """
     x = np.asarray(window, dtype=np.float64)
-    # Robustness: missing/inf values can appear due to upstream data issues.
-    # We normalize with nan-aware stats, then replace any non-finite outputs with 0.
-    mean = np.nanmean(x, axis=0)
-    std = np.nanstd(x, axis=0)
-    std[(std == 0) | ~np.isfinite(std)] = 1.0  # avoid division by zero / NaNs
-    out = (x - mean) / std
+    out = np.zeros_like(x)
+
+    if channel_names is None:
+        channel_names = ["open", "high", "low", "close", "volume", "close_ret"]
+
+    price_indices = [i for i, c in enumerate(channel_names) if c in ["open", "high", "low", "close"]]
+
+    for i, col_name in enumerate(channel_names):
+        if col_name in ["open", "high", "low", "close"]:
+            continue  # Handled below
+        elif col_name == "volume":
+            v = x[:, i]
+            v_mean = np.nanmean(v)
+            v_std = np.nanstd(v)
+            if v_std == 0 or ~np.isfinite(v_std):
+                v_std = 1.0
+            out[:, i] = (v - v_mean) / v_std
+        elif col_name == "close_ret" or "ret" in col_name:
+            out[:, i] = x[:, i] * 100.0
+        else:
+            v = x[:, i]
+            v_mean = np.nanmean(v)
+            v_std = np.nanstd(v)
+            if v_std == 0 or ~np.isfinite(v_std):
+                v_std = 1.0
+            out[:, i] = (v - v_mean) / v_std
+
+    if price_indices:
+        if "open" in channel_names:
+            base_price = x[0, channel_names.index("open")]
+        else:
+            base_price = x[0, price_indices[0]]
+
+        if base_price == 0 or ~np.isfinite(base_price):
+            base_price = 1.0
+
+        price_data = x[:, price_indices]
+        out[:, price_indices] = ((price_data - base_price) / base_price) * 100.0
+
     out[~np.isfinite(out)] = 0.0
     return out
 
@@ -144,7 +182,7 @@ def generate_windows(
     """
     channel_list = list(channels)
     records: list[WindowRecord] = []
-
+    
     for symbol, grp in df.groupby("symbol", sort=False):
         grp = grp.sort_values("time").reset_index(drop=True)
         # Compute close_ret on demand if requested and not already present.
@@ -152,6 +190,8 @@ def generate_windows(
             cr = grp["close"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
             grp = grp.assign(close_ret=cr)
         closes = grp["close"].values
+        highs = grp["high"].values
+        lows = grp["low"].values
         times = grp["time"].values
         feature_matrix = grp[channel_list].values  # (N, C)
 
@@ -167,11 +207,26 @@ def generate_windows(
             last_close = closes[w_end - 1]
             if last_close == 0:
                 continue
+            
+            # Triple-Barrier Labeling
+            label = 1  # Default to Neutral (Time stop)
+            for j in range(w_end, future_idx + 1):
+                # Check pessimistic case first: assume low hits stop-loss before high hits take-profit in the same session
+                low_ret = (lows[j] - last_close) / last_close
+                high_ret = (highs[j] - last_close) / last_close
+                
+                if low_ret <= down_threshold:
+                    label = 0  # Down (Stop-loss hit)
+                    break
+                elif high_ret >= up_threshold:
+                    label = 2  # Up (Take-profit hit)
+                    break
+            
+            # Keep future_return as the point-in-time return for logging/metadata
             future_return = (closes[future_idx] - last_close) / last_close
 
-            label = _compute_label(future_return, up_threshold, down_threshold)
             raw_window = feature_matrix[i:w_end].astype(np.float64)
-            normed = zscore_normalize_window(raw_window)
+            normed = zscore_normalize_window(raw_window, channel_names=channel_list)
 
             records.append(
                 WindowRecord(
