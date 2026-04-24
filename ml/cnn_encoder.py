@@ -124,7 +124,7 @@ class CNNEncoder(nn.Module):
             pe = _build_sinusoidal_pe(cfg.window_size, c3)
             # Registered buffer so it moves with .to(device) but isn't trained.
             self.register_buffer("pos_encoding", pe, persistent=False)
-            self.pe_scale = nn.Parameter(torch.tensor(0.02))
+            self.pe_scale = nn.Parameter(torch.tensor(0.5))
         else:
             self.pos_encoding = None  # type: ignore[assignment]
             self.pe_scale = None
@@ -140,7 +140,7 @@ class CNNEncoder(nn.Module):
         )
 
         # Learnable query token that attends over time to pool a single vector.
-        self.pool_query = nn.Parameter(torch.randn(1, 1, c3) * 0.02)
+        self.pool_query = nn.Parameter(torch.randn(1, 1, c3) * 0.1)
         self.attn = nn.MultiheadAttention(
             embed_dim=c3,
             num_heads=cfg.attn_heads,

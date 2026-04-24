@@ -52,6 +52,9 @@ class TrainConfig:
     use_pk_sampler: bool = True  # for SupCon: enforce P classes x K samples per batch
     pk_classes_per_batch: int = 3
     early_stop_patience: int = 15  # epochs without macro-F1 improvement
+    # Stride between consecutive training windows. stride=1 produces near-duplicate
+    # windows with occasionally flipped labels that poison SupCon contrast; 5 decorrelates them.
+    stride: int = 5
 
 
 class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -459,7 +462,7 @@ def train_from_ohlcv(
     if train_cfg.loss not in {"supcon", "ce", "triplet"}:
         raise ValueError("train_cfg.loss must be 'supcon', 'ce', or 'triplet'")
 
-    records = generate_windows(df)
+    records = generate_windows(df, stride=train_cfg.stride)
     train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
     if not train_recs:
         raise ValueError("No training windows generated; check OHLCV input range/quality.")
@@ -611,9 +614,10 @@ def main(argv: list[str] | None = None) -> int:
         default=TrainConfig.loss,
         help="Training objective for the encoder.",
     )
-    parser.add_argument("--triplet-margin", type=float, default=0.2)
-    parser.add_argument("--supcon-temperature", type=float, default=0.1)
-    parser.add_argument("--supcon-ce-weight", type=float, default=0.3)
+    parser.add_argument("--triplet-margin", type=float, default=TrainConfig.triplet_margin)
+    parser.add_argument("--supcon-temperature", type=float, default=TrainConfig.supcon_temperature)
+    parser.add_argument("--supcon-ce-weight", type=float, default=TrainConfig.supcon_ce_weight)
+    parser.add_argument("--stride", type=int, default=TrainConfig.stride)
     parser.add_argument(
         "--no-pk-sampler",
         action="store_true",
@@ -675,6 +679,7 @@ def main(argv: list[str] | None = None) -> int:
             pk_classes_per_batch=int(args.pk_classes_per_batch),
             use_balanced_sampler=not args.no_balanced_sampler,
             early_stop_patience=int(args.early_stop_patience),
+            stride=int(args.stride),
         ),
     )
     save_encoder(encoder, args.out)

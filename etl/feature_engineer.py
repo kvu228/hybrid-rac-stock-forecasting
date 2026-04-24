@@ -13,7 +13,7 @@ OHLCV_CHANNELS = ["open", "high", "low", "close", "volume"]
 # explicit directional/momentum signal that z-score within-window doesn't erase).
 FEATURE_CHANNELS = ["open", "high", "low", "close", "volume", "close_ret"]
 WINDOW_SIZE = 30
-LABEL_HORIZON = 5  # T+5 forward return for labeling
+LABEL_HORIZON = 10  # T+10 forward return — wider horizon reduces path-dependency noise in triple-barrier labels
 
 
 @dataclass(frozen=True)
@@ -148,8 +148,8 @@ def generate_windows(
     window_size: int = WINDOW_SIZE,
     horizon: int = LABEL_HORIZON,
     stride: int = 1,
-    up_threshold: float = 0.02,
-    down_threshold: float = -0.02,
+    up_threshold: float = 0.03,
+    down_threshold: float = -0.03,
     channels: list[str] | tuple[str, ...] = tuple(FEATURE_CHANNELS),
 ) -> list[WindowRecord]:
     """Create labeled sliding windows from cleaned OHLCV data.
