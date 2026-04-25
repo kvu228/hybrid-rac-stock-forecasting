@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from dotenv import load_dotenv
 from psycopg.sql import SQL, Identifier, Literal
 
 # Matches production migration 0006_indexes.py default (rebuild after DROP).
@@ -34,11 +35,14 @@ def normalize_database_url(raw: str) -> str:
 
 
 def require_database_url() -> str:
+    # Load .env from repo root (override=False: system env vars take priority).
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
     url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
         msg = "DATABASE_URL is required for benchmarks."
         raise SystemExit(msg)
     return normalize_database_url(url)
+
 
 
 def format_vector_literal(vec: Sequence[float]) -> str:

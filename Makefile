@@ -64,7 +64,7 @@ ML_ENCODER_TYPE ?= multiscale
 
 # Phase 6: DB benchmarks (require DATABASE_URL; HNSW scripts DROP/CREATE idx_embedding_hnsw)
 BENCH_K ?= 20
-BENCH_N_QUERIES ?= 30
+BENCH_N_QUERIES ?= 200
 BENCH_SEED ?= 42
 BENCH_EF_SEARCH ?= 100
 
@@ -267,6 +267,14 @@ ml-train-encoder:
 		--supcon-temperature $(ML_SUPCON_TEMP) \
 		--supcon-ce-weight $(ML_SUPCON_CE) \
 		--early-stop-patience $(ML_ES_PATIENCE) \
+		$(if $(filter 1,$(ML_HARD_MINING)),--use-hard-mining,) \
+		$(if $(filter 1,$(ML_ATR_THRESHOLD)),--use-atr-threshold,) \
+		--atr-multiplier $(ML_ATR_MULT) \
+		--dead-zone-pct $(ML_DEAD_ZONE) \
+		--encoder-type $(ML_ENCODER_TYPE) \
+		--positive-radius $(ML_POS_RADIUS) \
+		--negative-margin $(ML_NEG_MARGIN) \
+		--retcon-n-bins $(ML_RETCON_N_BINS) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 
@@ -305,6 +313,14 @@ ml-train-encoder-db-symbol: _require-symbol
 		--supcon-temperature $(ML_SUPCON_TEMP) \
 		--supcon-ce-weight $(ML_SUPCON_CE) \
 		--early-stop-patience $(ML_ES_PATIENCE) \
+		$(if $(filter 1,$(ML_HARD_MINING)),--use-hard-mining,) \
+		$(if $(filter 1,$(ML_ATR_THRESHOLD)),--use-atr-threshold,) \
+		--atr-multiplier $(ML_ATR_MULT) \
+		--dead-zone-pct $(ML_DEAD_ZONE) \
+		--encoder-type $(ML_ENCODER_TYPE) \
+		--positive-radius $(ML_POS_RADIUS) \
+		--negative-margin $(ML_NEG_MARGIN) \
+		--retcon-n-bins $(ML_RETCON_N_BINS) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 

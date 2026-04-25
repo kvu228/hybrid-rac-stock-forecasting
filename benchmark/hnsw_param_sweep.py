@@ -65,6 +65,9 @@ def main() -> None:
                 qv = format_vector_literal(vec)
                 exact_per_q.append(knn_top_ids(conn, qv, k_recall))
         finally:
+            # Restore default index after exact-scan phase (drop first in case
+            # something left a stale index from a previous interrupted run).
+            drop_hnsw_index(conn)
             create_hnsw_index(conn)
 
         for m in m_list:
@@ -106,6 +109,8 @@ def main() -> None:
                         }
                     )
 
+        # Restore production default HNSW index (drop last sweep's custom index first).
+        drop_hnsw_index(conn)
         create_hnsw_index(conn)
 
     summary = BenchRunMeta(
