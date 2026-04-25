@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import psycopg
 import torch
+from dotenv import load_dotenv
 
 from etl.feature_engineer import WindowRecord, generate_windows
 from ml.cnn_encoder import CNNEncoder, EncoderConfig, LegacyCNNEncoder, LegacyEncoderConfig, encode_batch
@@ -45,23 +47,29 @@ def _format_vector(vec: np.ndarray) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec.tolist()) + "]"
 
 
-def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder:
+def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder | torch.nn.Module:
     payload = torch.load(model_path, map_location="cpu")
     state_dict = payload.get("state_dict", {})
     cfg_dict = payload.get("config", {}) if isinstance(payload, dict) else {}
 
-    # Legacy checkpoints (v1) have state dict keys like "net.0.weight".
-    # New checkpoints have keys like "backbone.0.weight" and include config with n_channels=6.
     keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
-    is_legacy = any(k.startswith("net.") for k in keys) and not any(k.startswith("backbone.") for k in keys)
-    if is_legacy:
-        legacy_cfg = LegacyEncoderConfig(**cfg_dict) if cfg_dict else LegacyEncoderConfig()
-        model = LegacyCNNEncoder(legacy_cfg)
+    is_multiscale = any(k.startswith("branch_macro.") for k in keys)
+    is_legacy = any(k.startswith("net.") for k in keys)
+    
+    if is_multiscale:
+        from ml.cnn_encoder import MultiScaleCNNEncoder
+        cfg = LegacyEncoderConfig(**cfg_dict) if cfg_dict else LegacyEncoderConfig()
+        model = MultiScaleCNNEncoder(cfg)
+        model.load_state_dict(state_dict)
+    elif is_legacy:
+        cfg = LegacyEncoderConfig(**cfg_dict) if cfg_dict else LegacyEncoderConfig()
+        model = LegacyCNNEncoder(cfg)
         model.load_state_dict(state_dict)
     else:
         cfg = EncoderConfig(**cfg_dict) if cfg_dict else EncoderConfig()
         model = CNNEncoder(cfg)
         model.load_state_dict(state_dict)
+        
     model.eval()
     return model
 
@@ -187,37 +195,110 @@ def generate_and_insert(
         return InsertStats(windows=len(records), inserted=inserted, hnsw_index_used=hnsw)
 
 
+def _auto_device() -> str:
+    env_dev = os.environ.get("TORCH_DEVICE")
+    if env_dev and env_dev != "auto":
+        return env_dev
+    if getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _worker_fn(
+    database_url: str,
+    symbol: str,
+    model_path: Path,
+    start: date | None,
+    end: date | None,
+    device: str,
+    batch_size: int,
+    truncate_symbol: bool,
+) -> tuple[str, InsertStats | None, str | None]:
+    try:
+        stats = generate_and_insert(
+            database_url=database_url,
+            symbol=symbol,
+            model_path=model_path,
+            start=start,
+            end=end,
+            device=device,
+            batch_size=batch_size,
+            truncate_symbol=truncate_symbol,
+        )
+        return symbol, stats, None
+    except Exception as e:
+        import traceback
+        return symbol, None, traceback.format_exc()
+
+
 def main(argv: list[str] | None = None) -> int:
     def _parse_date(s: str) -> date:
         return date.fromisoformat(s)
 
     parser = argparse.ArgumentParser(description="Generate CNN embeddings and insert into pattern_embeddings.")
     parser.add_argument("--database-url", type=str, default="")
-    parser.add_argument("--symbol", type=str, required=True)
+    parser.add_argument("--symbol", type=str, default=None)
+    parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument("--symbols-file", type=str, default=None)
     parser.add_argument("--model", type=Path, default=Path("ml/model_store/cnn_encoder.pt"))
     parser.add_argument("--start", type=_parse_date, default=None)
     parser.add_argument("--end", type=_parse_date, default=None)
-    parser.add_argument("--device", type=str, default=os.environ.get("TORCH_DEVICE", "cpu"))
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--workers", type=int, default=6)
     parser.add_argument(
         "--truncate-symbol",
         action="store_true",
         help="Delete existing embeddings for this symbol before inserting.",
     )
     args = parser.parse_args(argv)
+    
+    load_dotenv(override=False)
+    if str(args.device).lower() == "auto":
+        args.device = _auto_device()
 
     db_url = args.database_url or _database_url()
-    stats = generate_and_insert(
-        database_url=db_url,
-        symbol=args.symbol,
-        model_path=args.model,
-        start=args.start,
-        end=args.end,
-        device=args.device,
-        batch_size=args.batch_size,
-        truncate_symbol=args.truncate_symbol,
-    )
-    print(stats)
+
+    from etl.pipeline import _load_symbols
+    symbols = []
+    if args.symbols or args.symbols_file:
+        symbols = _load_symbols(list(args.symbols) if args.symbols else None, args.symbols_file)
+    elif args.symbol:
+        symbols = [args.symbol]
+    else:
+        raise SystemExit("Provide --symbol, --symbols, or --symbols-file")
+
+    workers = max(1, min(args.workers, len(symbols)))
+    if workers > 1:
+        print(f"Generating embeddings for {len(symbols)} symbols using {workers} workers...")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = []
+            for sym in symbols:
+                futures.append(
+                    ex.submit(
+                        _worker_fn, db_url, sym, args.model, args.start, args.end,
+                        args.device, args.batch_size, args.truncate_symbol
+                    )
+                )
+            for i, fut in enumerate(as_completed(futures)):
+                sym, stats, err = fut.result()
+                if err:
+                    print(f"[{i + 1}/{len(symbols)}] ERROR {sym}: {err}")
+                else:
+                    print(f"[{i + 1}/{len(symbols)}] {sym}: {stats}")
+    else:
+        for i, sym in enumerate(symbols):
+            sym, stats, err = _worker_fn(
+                db_url, sym, args.model, args.start, args.end,
+                args.device, args.batch_size, args.truncate_symbol
+            )
+            if err:
+                print(f"[{i + 1}/{len(symbols)}] ERROR {sym}: {err}")
+            else:
+                print(f"[{i + 1}/{len(symbols)}] {sym}: {stats}")
+
     return 0
 
 

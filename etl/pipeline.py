@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -316,6 +316,96 @@ def _aggregate_ingest_results(results: list[tuple[str, int, int, int, int]]) -> 
     }
 
 
+def _get_api_keys() -> list[str]:
+    keys = []
+    for i in range(1, 20):
+        val = (os.getenv(f"VNSTOCK_API_KEY{i}") or "").strip()
+        if val:
+            keys.append(val)
+            
+    if not keys:
+        single = (os.getenv("VNSTOCK_API_KEY") or "").strip()
+        if single:
+            keys.append(single)
+    return keys
+
+
+def _chunk_list(lst: list[Any], n: int) -> list[list[Any]]:
+    if not lst:
+        return []
+    n = max(1, min(n, len(lst)))
+    k, m = divmod(len(lst), n)
+    return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+
+
+def _process_worker(
+    api_key: str | None,
+    jobs: list[tuple[str, date, date]],
+    database_url: str,
+    chunk_days: int,
+    requests_per_minute: int,
+    rate_limit_burst: int,
+) -> list[tuple[str, int, int, int, int]]:
+    import os
+    from etl.vnstock_fetcher import configure_rate_limiter
+
+    os.environ["VNSTOCK_DEBUG_AUTH"] = "0"
+    
+    if api_key:
+        try:
+            from vnstock import register_user
+            register_user(api_key=api_key)
+        except Exception:
+            pass
+
+    configure_rate_limiter(requests_per_minute=max(1, requests_per_minute), burst=max(1, rate_limit_burst))
+
+    results = []
+    for sym, s, e in jobs:
+        res = _fetch_clean_ingest_one(sym, s, e, database_url, chunk_days)
+        results.append(res)
+    return results
+
+
+def _execute_jobs(
+    jobs: list[tuple[str, date, date]],
+    database_url: str,
+    chunk_days: int,
+    concurrency: int,
+    rpm: int,
+    burst: int,
+) -> list[tuple[str, int, int, int, int]]:
+    api_keys = _get_api_keys()
+    
+    if len(api_keys) > 1:
+        chunks = _chunk_list(jobs, len(api_keys))
+        results = []
+        with ProcessPoolExecutor(max_workers=len(api_keys)) as ex:
+            futures = []
+            for i, chunk in enumerate(chunks):
+                if not chunk:
+                    continue
+                key = api_keys[i]
+                futures.append(ex.submit(_process_worker, key, chunk, database_url, chunk_days, rpm, burst))
+            
+            for fut in as_completed(futures):
+                results.extend(fut.result())
+        return results
+    else:
+        _register_vnstock_user_from_env()
+        configure_rate_limiter(requests_per_minute=max(1, rpm), burst=max(1, burst))
+        concurrency = max(1, int(concurrency))
+        
+        results = []
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futures = {
+                ex.submit(_fetch_clean_ingest_one, sym, s, e, database_url, chunk_days): sym for sym, s, e in jobs
+            }
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        return results
+
+
 def run_backfill(
     database_url: str,
     symbols: list[str],
@@ -328,7 +418,6 @@ def run_backfill(
     rate_limit_burst: int | None = None,
 ) -> dict[str, Any]:
     _load_dotenv_if_present()
-    _register_vnstock_user_from_env()
     rpm = (
         int(requests_per_minute)
         if requests_per_minute is not None
@@ -339,16 +428,11 @@ def run_backfill(
         if rate_limit_burst is not None
         else int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1")
     )
-    configure_rate_limiter(requests_per_minute=max(1, rpm), burst=max(1, burst))
-    concurrency = max(1, int(concurrency))
     chunk_days = int(chunk_days)
-    results: list[tuple[str, int, int, int, int]] = []
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {
-            ex.submit(_fetch_clean_ingest_one, sym, start, end, database_url, chunk_days): sym for sym in symbols
-        }
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    
+    jobs = [(sym, start, end) for sym in symbols]
+    results = _execute_jobs(jobs, database_url, chunk_days, concurrency, rpm, burst)
+    
     out = _aggregate_ingest_results(results)
     out["mode"] = "backfill"
     out["start"] = str(start)
@@ -367,7 +451,6 @@ def run_incremental(
     rate_limit_burst: int | None = None,
 ) -> dict[str, Any]:
     _load_dotenv_if_present()
-    _register_vnstock_user_from_env()
     rpm = (
         int(requests_per_minute)
         if requests_per_minute is not None
@@ -378,8 +461,6 @@ def run_incremental(
         if rate_limit_burst is not None
         else int((os.getenv("VNSTOCK_RATE_LIMIT_BURST") or "1").strip() or "1")
     )
-    configure_rate_limiter(requests_per_minute=max(1, rpm), burst=max(1, burst))
-    concurrency = max(1, int(concurrency))
     chunk_days = int(chunk_days)
     max_dates = _get_max_date_per_symbol(database_url, symbols)
     jobs: list[tuple[str, date, date]] = []
@@ -390,13 +471,8 @@ def run_incremental(
             continue
         jobs.append((sym, s, end))
 
-    results: list[tuple[str, int, int, int, int]] = []
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {
-            ex.submit(_fetch_clean_ingest_one, sym, s, e, database_url, chunk_days): sym for sym, s, e in jobs
-        }
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    results = _execute_jobs(jobs, database_url, chunk_days, concurrency, rpm, burst)
+    
     out = _aggregate_ingest_results(results)
     out["mode"] = "incremental"
     out["end"] = str(end)

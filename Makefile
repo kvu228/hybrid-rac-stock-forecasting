@@ -29,8 +29,8 @@ WIN_DATE_FLAGS := $(if $(strip $(WIN_START)),--start $(WIN_START),) $(if $(strip
 WINDOW_SIZE ?= 30
 HORIZON ?= 5
 STRIDE ?= 1
-UP_THRESHOLD ?= 0.02
-DOWN_THRESHOLD ?= -0.02
+UP_THRESHOLD ?= 0.04
+DOWN_THRESHOLD ?= -0.04
 TRAIN_RATIO ?= 0.8
 SR_ORDER ?= 5
 
@@ -41,13 +41,13 @@ OHLCV_TSV ?= tests/fixtures/ohlcv_small.tsv
 ML_ENCODER_EPOCHS ?= 60
 ML_ENCODER_BATCH ?= 512
 ML_LR ?= 0.0003
-ML_LOSS ?= supcon
+ML_LOSS ?= mse
 ML_SUPCON_TEMP ?= 0.2
 ML_SUPCON_CE ?= 0.2
 ML_ES_PATIENCE ?= 15
 # Small TSV smoke training (fixture): keep fast defaults separate from DB training
 ML_TSV_TRAIN_EPOCHS ?= 8
-ML_DEVICE ?= cpu
+ML_DEVICE ?= auto
 ML_EMBED_BATCH ?= 512
 
 # Phase 6: DB benchmarks (require DATABASE_URL; HNSW scripts DROP/CREATE idx_embedding_hnsw)
@@ -299,16 +299,13 @@ ml-embed-symbol: _require-symbol
 
 .PHONY: ml-embed-vn100
 ml-embed-vn100:
-	set -e; grep -vE '^[[:space:]]*#|^[[:space:]]*$$' "$(TICKERS_VN100)" | tr -d '\015' | while IFS= read -r sym; do \
-		[ -z "$$sym" ] && continue; \
-		echo "== embedding $$sym =="; \
-		$(PY) -m ml.embedding_generator \
-			--symbol "$$sym" \
-			--truncate-symbol \
-			--model $(ML_ENCODER_OUT) \
-			--batch-size $(ML_EMBED_BATCH) \
-			--device $(ML_DEVICE) || exit 1; \
-	done
+	$(PY) -m ml.embedding_generator \
+		--symbols-file "$(TICKERS_VN100)" \
+		--truncate-symbol \
+		--model $(ML_ENCODER_OUT) \
+		--batch-size $(ML_EMBED_BATCH) \
+		--device $(ML_DEVICE) \
+		--workers 4
 
 # PowerShell-friendly VN100 embedding loop (Windows)
 .PHONY: windows-ps-embed-vn100

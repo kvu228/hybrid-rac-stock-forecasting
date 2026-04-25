@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 
 from etl.feature_engineer import WindowRecord, forward_fill_trading_days, generate_windows, train_test_split_by_time
 from etl.pipeline import _load_symbols
-from ml.cnn_encoder import CNNEncoder, EncoderConfig
+from ml.cnn_encoder import MultiScaleCNNEncoder as CNNEncoder, LegacyEncoderConfig as EncoderConfig
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class TrainConfig:
     seed: int = 42
     train_ratio: float = 0.8
     num_workers: int = 0
-    loss: str = "supcon"  # "supcon" | "ce" | "triplet"
+    loss: str = "supcon"  # "supcon" | "ce" | "triplet" | "mse"
     triplet_margin: float = 0.2
     supcon_temperature: float = 0.2
     supcon_ce_weight: float = 0.2  # auxiliary CE weight on top of SupCon
@@ -448,16 +448,88 @@ def _train_encoder_triplet(
     return encoder, last_loss
 
 
+def _train_autoencoder(
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    encoder: CNNEncoder,
+    train_cfg: TrainConfig,
+) -> tuple[nn.Module, dict[str, float | str]]:
+    from ml.cnn_encoder import CNNAutoencoder
+    device = train_cfg.device
+    model = CNNAutoencoder(encoder).to(device)
+    mse_loss = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, train_cfg.epochs))
+
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    epochs_no_improve = 0
+    last_loss = 0.0
+    loss_history: list[float] = []
+
+    for epoch in range(train_cfg.epochs):
+        model.train()
+        for xb, _ in train_loader:
+            xb = xb.to(device)
+            opt.zero_grad(set_to_none=True)
+            _, x_recon = model(xb)
+            loss = mse_loss(x_recon, xb)
+            loss.backward()
+            opt.step()
+            last_loss = float(loss.item())
+        scheduler.step()
+
+        val_loss = 0.0
+        if test_loader is not None:
+            model.eval()
+            total_val_loss = 0.0
+            batches = 0
+            with torch.inference_mode():
+                for xb, _ in test_loader:
+                    xb = xb.to(device)
+                    _, x_recon = model(xb)
+                    v_loss = mse_loss(x_recon, xb)
+                    total_val_loss += float(v_loss.item())
+                    batches += 1
+            val_loss = total_val_loss / max(1, batches)
+        else:
+            val_loss = last_loss
+
+        loss_history.append(val_loss)
+        print(f"  epoch {epoch + 1:>3}/{train_cfg.epochs}  train_mse={last_loss:.4f}  val_mse={val_loss:.4f}")
+
+        if val_loss < best_loss - 1e-6:
+            best_loss = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if train_cfg.early_stop_patience > 0 and epochs_no_improve >= train_cfg.early_stop_patience:
+                print(f"  early stop at epoch {epoch + 1} (no val_mse improvement for {epochs_no_improve} epochs)")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    metrics: dict[str, float | str] = {
+        "last_train_mse": float(last_loss),
+        "best_val_mse": float(best_loss),
+        "epochs_run": float(len(loss_history)),
+        "loss_mode": "mse",
+    }
+    return model, metrics
+
+
 def train_from_ohlcv(
     df: pd.DataFrame,
     *,
     encoder_cfg: EncoderConfig = EncoderConfig(),
     train_cfg: TrainConfig = TrainConfig(),
 ) -> tuple[CNNEncoder, dict[str, float | str]]:
-    """Train encoder with SupCon (default), CE-only, or triplet loss."""
+    """Train encoder with SupCon (default), CE-only, triplet, or mse (autoencoder)."""
     _set_seed(train_cfg.seed)
-    if train_cfg.loss not in {"supcon", "ce", "triplet"}:
-        raise ValueError("train_cfg.loss must be 'supcon', 'ce', or 'triplet'")
+    if train_cfg.loss not in {"supcon", "ce", "triplet", "mse"}:
+        raise ValueError("train_cfg.loss must be 'supcon', 'ce', 'triplet', or 'mse'")
 
     records = generate_windows(df)
     train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
@@ -554,6 +626,15 @@ def train_from_ohlcv(
         }
         return encoder, metrics
 
+    if train_cfg.loss == "mse":
+        autoencoder, train_metrics = _train_autoencoder(train_loader, test_loader, encoder, train_cfg)
+        metrics: dict[str, float | str] = {
+            "train_windows": float(len(train_ds)),
+            "test_windows": float(len(test_ds)) if test_ds is not None else 0.0,
+            **train_metrics,
+        }
+        return autoencoder.encoder, metrics
+
     # We use PKBatchSampler which forces exactly equal representation in every batch.
     # Therefore, the CE loss should NOT use class_weights to penalize majority classes,
     # as the batch itself is already perfectly balanced (e.g. 170 Down, 170 Neutral, 170 Up).
@@ -576,6 +657,17 @@ def save_encoder(encoder: CNNEncoder, out_path: Path) -> None:
         },
         out_path,
     )
+
+
+def _auto_device() -> str:
+    env_dev = os.environ.get("TORCH_DEVICE")
+    if env_dev and env_dev != "auto":
+        return env_dev
+    if getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -604,10 +696,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
-    parser.add_argument("--device", type=str, default=os.environ.get("TORCH_DEVICE", "cpu"))
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
         "--loss",
-        choices=("supcon", "ce", "triplet"),
+        choices=("supcon", "ce", "triplet", "mse"),
         default=TrainConfig.loss,
         help="Training objective for the encoder.",
     )
@@ -631,6 +723,9 @@ def main(argv: list[str] | None = None) -> int:
 
     load_dotenv(override=False)
 
+    if str(args.device).lower() == "auto":
+        args.device = _auto_device()
+
     if str(args.device).lower().startswith("cuda"):
         if getattr(torch.version, "cuda", None) is None:
             raise SystemExit(
@@ -642,6 +737,9 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "device=cuda but torch.cuda.is_available() is False (GPU/driver?). Use --device cpu or fix CUDA."
             )
+    elif str(args.device).lower() == "mps":
+        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+            raise SystemExit("device=mps but torch.backends.mps.is_available() is False. Ensure you are on an Apple Silicon Mac.")
 
     if args.from_db:
         if not args.symbols and not args.symbols_file:

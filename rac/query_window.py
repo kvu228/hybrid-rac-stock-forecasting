@@ -71,7 +71,7 @@ def build_normalized_query_window(
     start_i = i - (WINDOW_SIZE - 1)
     slice_df = df.loc[start_i:i].copy()
     raw = slice_df[channel_list].to_numpy(dtype=np.float64)
-    normed = zscore_normalize_window(raw)
+    normed = zscore_normalize_window(raw, channel_names=channel_list)
     w_start = slice_df["time"].iloc[0].to_pydatetime()
     w_end = slice_df["time"].iloc[-1].to_pydatetime()
     # Keep the raw OHLCV slice (without close_ret) for visualization callers.

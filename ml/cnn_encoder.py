@@ -183,9 +183,108 @@ class CNNEncoder(nn.Module):
         return nn.functional.normalize(emb, p=2.0, dim=1)
 
 
+class MultiScaleCNNEncoder(nn.Module):
+    """Multi-Scale CNN encoder for time-series pattern matching.
+    Extracts features from the full window, half window, and 1/6 window
+    to capture macro, meso, and micro trends respectively.
+    """
+
+    def __init__(self, cfg: LegacyEncoderConfig = LegacyEncoderConfig()) -> None:
+        super().__init__()
+        self.cfg = cfg
+        c1, c2, c3 = cfg.conv_channels
+        k = cfg.kernel_size
+        
+        def make_branch() -> nn.Module:
+            return nn.Sequential(
+                nn.Conv1d(cfg.n_channels, c1, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+                nn.Conv1d(c1, c2, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+                nn.Conv1d(c2, c3, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Dropout(cfg.dropout),
+            )
+            
+        self.branch_macro = make_branch()
+        self.branch_meso = make_branch()
+        self.branch_micro = make_branch()
+        
+        # 3 branches * c3 channels each -> embedding_dim
+        self.proj = nn.Linear(c3 * 3, cfg.embedding_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected 3D tensor (B,T,C), got shape={tuple(x.shape)}")
+        
+        # Transpose for Conv1d: (B, C, T)
+        x_t = x.transpose(1, 2)
+        T = x_t.size(2)
+        
+        # Define multi-scale window lengths dynamically based on actual T
+        k = self.cfg.kernel_size
+        len_meso = max(k, T // 2)
+        len_micro = max(k, T // 6)
+        
+        feat_macro = self.branch_macro(x_t)
+        feat_meso = self.branch_meso(x_t[:, :, -len_meso:])
+        feat_micro = self.branch_micro(x_t[:, :, -len_micro:])
+        
+        concat = torch.cat([feat_macro, feat_meso, feat_micro], dim=1)  # (B, c3*3)
+        z = self.proj(concat)  # (B, embedding_dim)
+        
+        return nn.functional.normalize(z, p=2.0, dim=1)
+
+
+class CNNAutoencoder(nn.Module):
+    """Autoencoder wrapper for LegacyCNNEncoder to train via reconstruction."""
+
+    def __init__(self, encoder: LegacyCNNEncoder | MultiScaleCNNEncoder) -> None:
+        super().__init__()
+        self.encoder = encoder
+        cfg = encoder.cfg
+        
+        # Decoder attempts to reverse the encoder.
+        # Encoder uses AdaptiveAvgPool1d(1) which collapses the temporal dimension.
+        # We need to project the 128D vector back to (C, T) sequence.
+        # LegacyCNNEncoder channels: n_channels -> c1 -> c2 -> c3 -> pool
+        c1, c2, c3 = cfg.conv_channels
+        
+        self.decoder_linear = nn.Sequential(
+            nn.Linear(cfg.embedding_dim, c3 * cfg.window_size),
+            nn.ReLU(),
+        )
+        
+        self.decoder_conv = nn.Sequential(
+            nn.ConvTranspose1d(c3, c2, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(c2, c1, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(c1, cfg.n_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        x shape: (B, T, C)
+        Returns:
+            z: (B, embedding_dim)
+            x_recon: (B, T, C)
+        """
+        z = self.encoder(x)
+        
+        b = z.size(0)
+        d = self.decoder_linear(z)
+        d = d.view(b, self.encoder.cfg.conv_channels[2], self.encoder.cfg.window_size)
+        
+        d = self.decoder_conv(d)  # (B, C, T)
+        return z, d.transpose(1, 2)  # (B, T, C)
+
+
 @torch.inference_mode()
 def encode_batch(
-    model: CNNEncoder | LegacyCNNEncoder,
+    model: CNNEncoder | LegacyCNNEncoder | MultiScaleCNNEncoder,
     windows: np.ndarray,
     *,
     device: str | torch.device = "cpu",

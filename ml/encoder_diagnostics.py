@@ -452,6 +452,17 @@ def run_diagnostics(
     return metrics
 
 
+def _auto_device() -> str:
+    env_dev = os.environ.get("TORCH_DEVICE")
+    if env_dev and env_dev != "auto":
+        return env_dev
+    if getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def main(argv: list[str] | None = None) -> int:
     def _parse_date(s: str) -> date:
         return date.fromisoformat(s)
@@ -472,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         default=45,
         help="Exclude neighbors with same symbol within ± this many days of query window_end.",
     )
-    parser.add_argument("--device", type=str, default=os.environ.get("TORCH_DEVICE", "cpu"))
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--pca-per-label", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=42)
@@ -480,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     load_dotenv(override=False)
+    if str(args.device).lower() == "auto":
+        args.device = _auto_device()
+        
     database_url = (args.database_url or "").strip() or _database_url()
     if not args.encoder.is_file():
         raise SystemExit(f"Encoder not found: {args.encoder}")
