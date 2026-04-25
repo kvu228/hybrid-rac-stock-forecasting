@@ -11,6 +11,9 @@ import pandas as pd
 from etl.feature_engineer import (
     FEATURE_CHANNELS,
     WINDOW_SIZE,
+    _compute_bb_pct,
+    _compute_macd_signal,
+    _compute_rsi,
     forward_fill_trading_days,
     zscore_normalize_window,
 )
@@ -51,9 +54,19 @@ def build_normalized_query_window(
     df = forward_fill_trading_days(df)
     df = df.sort_values("time").reset_index(drop=True)
     channel_list = list(channels)
+    _INDICATOR_COLS = {"rsi_14", "bb_pct", "macd_signal"}
     if "close_ret" in channel_list and "close_ret" not in df.columns:
         cr = df["close"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
         df = df.assign(close_ret=cr)
+    # Compute technical indicators if needed.
+    if _INDICATOR_COLS & set(channel_list):
+        c = df["close"].values.astype(float)
+        if "rsi_14" in channel_list and "rsi_14" not in df.columns:
+            df = df.assign(rsi_14=_compute_rsi(c))
+        if "bb_pct" in channel_list and "bb_pct" not in df.columns:
+            df = df.assign(bb_pct=_compute_bb_pct(c))
+        if "macd_signal" in channel_list and "macd_signal" not in df.columns:
+            df = df.assign(macd_signal=_compute_macd_signal(c))
 
     target = _normalize_window_end(window_end)
     match = df.index[df["time"] == target].tolist()

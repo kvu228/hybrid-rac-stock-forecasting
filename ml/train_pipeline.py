@@ -29,7 +29,12 @@ from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 
 from etl.feature_engineer import WindowRecord, forward_fill_trading_days, generate_windows, train_test_split_by_time
 from etl.pipeline import _load_symbols
-from ml.cnn_encoder import MultiScaleCNNEncoder as CNNEncoder, LegacyEncoderConfig as EncoderConfig
+from ml.cnn_encoder import (
+    MultiScaleCNNEncoder as CNNEncoder,
+    LegacyEncoderConfig as EncoderConfig,
+    TemporalTransformerEncoder,
+    TransformerConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,20 @@ class TrainConfig:
     use_pk_sampler: bool = True  # for SupCon: enforce P classes x K samples per batch
     pk_classes_per_batch: int = 3
     early_stop_patience: int = 15  # epochs without macro-F1 improvement
+    # Hard-mining: mine hardest positive+negative within each batch for SupCon.
+    use_hard_mining: bool = False
+    hard_mining_fraction: float = 0.5  # fraction of batch slots to fill with hard pairs
+    # Dynamic ATR-based labeling.
+    use_atr_threshold: bool = False
+    atr_multiplier: float = 1.5
+    atr_period: int = 14
+    dead_zone_pct: float = 0.0  # 0 = disabled; 0.2 = discard ±20% of threshold boundary
+    # Encoder architecture.
+    encoder_type: str = "multiscale"  # "multiscale" | "transformer"
+    # Return-Continuous SupCon (retcon) parameters.
+    positive_radius: float = 0.01   # |ret_i - ret_j| < ε  → positive pair
+    negative_margin: float = 0.03   # |ret_i - ret_j| > δ  → negative pair (neutral zone excluded)
+    retcon_n_bins: int = 10         # number of return quantile bins for ReturnBinSampler
 
 
 class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -68,8 +87,30 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return x, y
 
 
+class WindowDatasetWithReturn(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    """Dataset that also yields future_return alongside (window, label).
+
+    Used by Return-Continuous SupCon (retcon) training — the loss uses
+    the continuous return value instead of the discrete label.
+    """
+
+    def __init__(self, windows: np.ndarray, labels: np.ndarray, future_returns: np.ndarray) -> None:
+        self.windows = windows.astype(np.float32, copy=False)
+        self.labels = labels.astype(np.int64, copy=False)
+        self.future_returns = future_returns.astype(np.float32, copy=False)
+
+    def __len__(self) -> int:  # pragma: no cover
+        return int(self.windows.shape[0])
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = torch.from_numpy(self.windows[idx])
+        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        r = torch.tensor(self.future_returns[idx], dtype=torch.float32)
+        return x, y, r
+
+
 class EncoderWithHead(nn.Module):
-    def __init__(self, encoder: CNNEncoder, n_classes: int = 3) -> None:
+    def __init__(self, encoder: CNNEncoder | TemporalTransformerEncoder, n_classes: int = 3) -> None:
         super().__init__()
         self.encoder = encoder
         self.head = nn.Linear(encoder.cfg.embedding_dim, n_classes)
@@ -173,6 +214,55 @@ def _balanced_sampler(labels: np.ndarray) -> WeightedRandomSampler:
     )
 
 
+class ReturnBinSampler(Sampler[list[int]]):
+    """Return-stratified batch sampler for Return-Continuous SupCon.
+
+    Divides future_returns into ``n_bins`` quantile bins, then samples
+    ``samples_per_bin`` items from each bin to form each batch.  This
+    ensures every batch spans the full return distribution (both bullish
+    and bearish windows) so the loss always has a rich mix of positive
+    and negative pairs.
+    """
+
+    def __init__(
+        self,
+        future_returns: np.ndarray,
+        *,
+        n_bins: int = 10,
+        samples_per_bin: int = 51,
+        seed: int = 42,
+    ) -> None:
+        self._rng = np.random.default_rng(seed)
+        self.n_bins = int(n_bins)
+        self.samples_per_bin = int(samples_per_bin)
+
+        # Quantile-bin the returns (equal-frequency bins).
+        quantiles = np.linspace(0, 100, self.n_bins + 1)
+        boundaries = np.percentile(future_returns, quantiles)
+        bin_ids = np.digitize(future_returns, boundaries[1:-1])  # 0 … n_bins-1
+
+        self._indices_by_bin: dict[int, np.ndarray] = {
+            b: np.where(bin_ids == b)[0] for b in range(self.n_bins)
+        }
+        total = self.n_bins * self.samples_per_bin
+        self._batches_per_epoch = max(1, len(future_returns) // total)
+
+    def __iter__(self):
+        for _ in range(self._batches_per_epoch):
+            batch: list[int] = []
+            for b in range(self.n_bins):
+                pool = self._indices_by_bin[b]
+                if len(pool) == 0:
+                    continue
+                replace = len(pool) < self.samples_per_bin
+                idxs = self._rng.choice(pool, size=self.samples_per_bin, replace=replace)
+                batch.extend(int(i) for i in idxs.tolist())
+            yield batch
+
+    def __len__(self) -> int:  # pragma: no cover
+        return self._batches_per_epoch
+
+
 class PKBatchSampler(Sampler[list[int]]):
     """P-K batch sampler: pick P classes, K samples per class each batch.
 
@@ -243,21 +333,13 @@ def _supcon_loss(
     *,
     temperature: float,
 ) -> torch.Tensor:
-    """Supervised Contrastive Loss (Khosla et al., 2020) on L2-normalized features.
-
-    Pulls together same-label samples and pushes apart different-label samples
-    on the unit sphere — directly shapes the cosine-distance neighborhoods
-    used by pgvector at query time.
-    """
+    """Supervised Contrastive Loss (Khosla et al., 2020) on L2-normalized features."""
     device = features.device
     b = features.size(0)
     if b < 2:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # Cosine similarity matrix (features are already L2-normalized by the encoder).
     sim = torch.matmul(features, features.t()) / float(temperature)
-
-    # For numerical stability subtract per-row max, then mask self-contrast.
     sim = sim - sim.max(dim=1, keepdim=True).values.detach()
     logits = sim
     self_mask = torch.eye(b, device=device, dtype=torch.bool)
@@ -272,12 +354,139 @@ def _supcon_loss(
     pos_count = positive_mask.sum(dim=1).clamp(min=1)
     mean_log_prob_pos = (log_prob * positive_mask).sum(dim=1) / pos_count
 
-    # Skip anchors that have no positive (class singletons in batch).
     valid = positive_mask.any(dim=1)
     if not valid.any():
         return torch.tensor(0.0, device=device, requires_grad=True)
 
     return -mean_log_prob_pos[valid].mean()
+
+
+def _return_continuous_supcon_loss(
+    features: torch.Tensor,
+    returns: torch.Tensor,
+    *,
+    temperature: float,
+    positive_radius: float,
+    negative_margin: float,
+) -> torch.Tensor:
+    """Return-Continuous Supervised Contrastive Loss (RetCon).
+
+    Defines positive and negative pairs using continuous future returns
+    instead of discrete Up/Down/Neutral labels, completely eliminating
+    label noise from threshold-based labeling.
+
+    Pair definitions (for each anchor i):
+      Positive (j): |return_i - return_j| < positive_radius
+        → windows with similar future outcomes, pulled together.
+      Negative (j): |return_i - return_j| > negative_margin
+        → windows with very different future outcomes, pushed apart.
+      Neutral zone (positive_radius ≤ Δret ≤ negative_margin):
+        excluded from the loss — ambiguous pairs don't contribute.
+
+    Uses the standard SupCon log-softmax formulation over the filtered
+    positive/negative sets.
+    """
+    device = features.device
+    b = features.size(0)
+    if b < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # Pairwise absolute return difference  (b, b)
+    ret_i = returns.view(-1, 1)
+    ret_j = returns.view(1, -1)
+    delta = (ret_i - ret_j).abs()
+
+    self_mask = torch.eye(b, device=device, dtype=torch.bool)
+
+    # Binary pair masks
+    positive_mask = (delta < positive_radius) & ~self_mask   # close returns
+    negative_mask = delta > negative_margin                   # far returns
+
+    # Cosine similarity scaled by temperature
+    sim = torch.matmul(features, features.t()) / temperature   # (b, b)
+    sim = sim - sim.max(dim=1, keepdim=True).values.detach()   # numerical stability
+
+    # Denominator: sum exp over non-self pairs (positive + negative; neutral excluded)
+    contrib_mask = (positive_mask | negative_mask)             # non-neutral, non-self
+    exp_sim = torch.exp(sim)
+    exp_denom = exp_sim.masked_fill(~contrib_mask, 0.0).sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+    log_prob = sim - torch.log(exp_denom)
+
+    # Loss: average over positive pairs per anchor
+    has_pos = positive_mask.any(dim=1)
+    if not has_pos.any():
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    pos_count = positive_mask.sum(dim=1).clamp(min=1)
+    mean_log_prob_pos = (log_prob * positive_mask).sum(dim=1) / pos_count
+    return -mean_log_prob_pos[has_pos].mean()
+
+
+def _batch_hard_supcon_loss(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    """Semi-Hard Supervised Contrastive Loss.
+
+    Semi-Hard mining (FaceNet, Schroff et al. 2015) selects:
+      - Hardest positive: same-label sample with LOWEST cosine similarity.
+      - Semi-hard negative: different-label sample that is:
+          * Farther than the hardest positive (so loss > 0, gradient exists)
+          * But closest among those negatives (most informative gradient)
+        If no semi-hard negative exists, falls back to the hardest negative.
+
+    Semi-hard mining avoids the gradient collapse of pure hard mining while
+    still providing more informative gradients than random sampling.
+    This is the recommended strategy for contrastive learning on noisy data.
+    """
+    device = features.device
+    b = features.size(0)
+    if b < 4:
+        return _supcon_loss(features, labels, temperature=temperature)
+
+    # Cosine similarity matrix (b x b), already L2-normalized.
+    sim_mat = torch.matmul(features, features.t())  # range [-1, 1]
+    self_mask = torch.eye(b, device=device, dtype=torch.bool)
+    labels_col = labels.view(-1, 1)
+    positive_mask = (labels_col == labels_col.t()) & ~self_mask
+    negative_mask = (labels_col != labels_col.t())
+
+    has_pos = positive_mask.any(dim=1)
+    has_neg = negative_mask.any(dim=1)
+    valid = has_pos & has_neg
+    if not valid.any():
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    INF = 1e9
+
+    # Hardest positive: min sim among same-label.
+    sim_pos = sim_mat.masked_fill(~positive_mask, INF)
+    hp_sim, _ = sim_pos.min(dim=1)                         # (b,)
+
+    # Semi-hard negative: different-label AND farther than hardest-positive.
+    hp_expanded = hp_sim.unsqueeze(1).expand_as(sim_mat)
+    semi_hard_mask = negative_mask & (sim_mat > hp_expanded)
+    sim_sh = sim_mat.masked_fill(~semi_hard_mask, -INF)
+    hn_sim_semi, _ = sim_sh.max(dim=1)                     # (b,)
+
+    # Fallback: hardest negative (for anchors with no semi-hard pair).
+    sim_neg = sim_mat.masked_fill(~negative_mask, -INF)
+    hn_sim_hard, _ = sim_neg.max(dim=1)                    # (b,)
+
+    has_semi = semi_hard_mask.any(dim=1)
+    hn_sim = torch.where(has_semi, hn_sim_semi, hn_sim_hard)
+
+    # Loss: numerically stable log-softmax over [hp, hn].
+    hp_t = hp_sim[valid] / temperature
+    hn_t = hn_sim[valid] / temperature
+    max_t = torch.maximum(hp_t, hn_t).detach()
+    log_sum_exp = max_t + torch.log(
+        torch.exp(hp_t - max_t) + torch.exp(hn_t - max_t) + 1e-12
+    )
+    return -(hp_t - log_sum_exp).mean()
 
 
 def _eval_macro_f1(
@@ -324,6 +533,11 @@ def _train_encoder(
     if train_cfg.loss not in {"supcon", "ce"}:
         raise ValueError(f"Unsupported loss for _train_encoder: {train_cfg.loss}")
 
+    # Choose SupCon variant based on hard-mining flag.
+    _loss_fn = _batch_hard_supcon_loss if getattr(train_cfg, "use_hard_mining", False) else _supcon_loss
+    if getattr(train_cfg, "use_hard_mining", False):
+        print("  [BatchHard SupCon] Mining hardest positive + negative per anchor.")
+
     best_f1 = -1.0
     best_state: dict[str, torch.Tensor] | None = None
     epochs_no_improve = 0
@@ -341,7 +555,7 @@ def _train_encoder(
             z, logits = model(xb)
             loss_ce = ce_loss(logits, yb)
             if use_supcon:
-                loss_supcon = _supcon_loss(z, yb, temperature=train_cfg.supcon_temperature)
+                loss_supcon = _loss_fn(z, yb, temperature=train_cfg.supcon_temperature)
                 loss = loss_supcon + train_cfg.supcon_ce_weight * loss_ce
                 last_supcon = float(loss_supcon.item())
             else:  # ce only
@@ -520,30 +734,139 @@ def _train_autoencoder(
     return model, metrics
 
 
+def _train_encoder_retcon(
+    train_loader: DataLoader,
+    test_loader: DataLoader | None,
+    encoder: CNNEncoder | TemporalTransformerEncoder,
+    train_cfg: TrainConfig,
+) -> tuple[CNNEncoder | TemporalTransformerEncoder, dict[str, float | str]]:
+    """Train encoder with Return-Continuous SupCon (RetCon).
+
+    Uses |return_i - return_j| to define positive/negative pairs instead
+    of discrete Up/Down/Neutral labels.  This eliminates label noise from
+    threshold-based labeling entirely.
+
+    The DataLoader must yield (x, label, future_return) tuples (use
+    WindowDatasetWithReturn + ReturnBinSampler).
+
+    Early stopping is based on val retcon loss (lower = better).
+    """
+    device = train_cfg.device
+    encoder = encoder.to(device)
+    opt = torch.optim.AdamW(encoder.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, train_cfg.epochs))
+
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    epochs_no_improve = 0
+    last_loss = 0.0
+    loss_history: list[float] = []
+
+    print(f"  [RetCon] pos_radius={train_cfg.positive_radius:.3f}  neg_margin={train_cfg.negative_margin:.3f}  temp={train_cfg.supcon_temperature:.3f}")
+
+    for epoch in range(train_cfg.epochs):
+        encoder.train()
+        batch_losses: list[float] = []
+        for batch in train_loader:
+            xb, _yb, rb = batch
+            xb = xb.to(device)
+            rb = rb.to(device)
+            opt.zero_grad(set_to_none=True)
+            z = encoder(xb)
+            loss = _return_continuous_supcon_loss(
+                z, rb,
+                temperature=train_cfg.supcon_temperature,
+                positive_radius=train_cfg.positive_radius,
+                negative_margin=train_cfg.negative_margin,
+            )
+            if loss.requires_grad:
+                loss.backward()
+                opt.step()
+            batch_losses.append(float(loss.item()))
+        scheduler.step()
+        last_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+
+        # Validation retcon loss.
+        val_loss = last_loss
+        if test_loader is not None:
+            encoder.eval()
+            val_batch_losses: list[float] = []
+            with torch.inference_mode():
+                for batch in test_loader:
+                    xb, _yb, rb = batch
+                    xb = xb.to(device)
+                    rb = rb.to(device)
+                    z = encoder(xb)
+                    v_loss = _return_continuous_supcon_loss(
+                        z, rb,
+                        temperature=train_cfg.supcon_temperature,
+                        positive_radius=train_cfg.positive_radius,
+                        negative_margin=train_cfg.negative_margin,
+                    )
+                    val_batch_losses.append(float(v_loss.item()))
+            val_loss = float(np.mean(val_batch_losses)) if val_batch_losses else last_loss
+            encoder.train()
+
+        loss_history.append(val_loss)
+        print(f"  epoch {epoch + 1:>3}/{train_cfg.epochs}  retcon={last_loss:.4f}  val_retcon={val_loss:.4f}")
+
+        if val_loss < best_loss - 1e-5:
+            best_loss = val_loss
+            best_state = {k: v.detach().clone() for k, v in encoder.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if train_cfg.early_stop_patience > 0 and epochs_no_improve >= train_cfg.early_stop_patience:
+                print(f"  early stop at epoch {epoch + 1} (no val_retcon improvement for {epochs_no_improve} epochs)")
+                break
+
+    if best_state is not None:
+        encoder.load_state_dict(best_state)
+
+    metrics: dict[str, float | str] = {
+        "last_train_retcon": float(last_loss),
+        "best_val_retcon": float(best_loss),
+        "epochs_run": float(len(loss_history)),
+        "loss_mode": "retcon",
+    }
+    return encoder, metrics
+
+
 def train_from_ohlcv(
     df: pd.DataFrame,
     *,
     encoder_cfg: EncoderConfig = EncoderConfig(),
     train_cfg: TrainConfig = TrainConfig(),
 ) -> tuple[CNNEncoder, dict[str, float | str]]:
-    """Train encoder with SupCon (default), CE-only, triplet, or mse (autoencoder)."""
+    """Train encoder with SupCon (default), CE-only, triplet, mse (autoencoder), or retcon."""
     _set_seed(train_cfg.seed)
-    if train_cfg.loss not in {"supcon", "ce", "triplet", "mse"}:
-        raise ValueError("train_cfg.loss must be 'supcon', 'ce', 'triplet', or 'mse'")
+    if train_cfg.loss not in {"supcon", "ce", "triplet", "mse", "retcon"}:
+        raise ValueError("train_cfg.loss must be 'supcon', 'ce', 'triplet', 'mse', or 'retcon'")
 
-    records = generate_windows(df)
+    records = generate_windows(
+        df,
+        up_threshold=float(os.environ.get("ML_UP_THRESHOLD", "0.04")),
+        down_threshold=float(os.environ.get("ML_DOWN_THRESHOLD", "-0.04")),
+        use_atr_threshold=train_cfg.use_atr_threshold,
+        atr_multiplier=train_cfg.atr_multiplier,
+        atr_period=train_cfg.atr_period,
+        dead_zone_pct=train_cfg.dead_zone_pct,
+    )
     train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
     if not train_recs:
         raise ValueError("No training windows generated; check OHLCV input range/quality.")
 
     x_train, y_train = _records_to_arrays(train_recs)
+    r_train = np.asarray([rec.future_return for rec in train_recs], dtype=np.float32)
     if test_recs:
         x_test, y_test = _records_to_arrays(test_recs)
+        r_test = np.asarray([rec.future_return for rec in test_recs], dtype=np.float32)
     else:
         # Fallback to channel count inferred from train to avoid hard-coded 5.
         empty_channels = x_train.shape[2]
         x_test = np.zeros((0, encoder_cfg.window_size, empty_channels), dtype=np.float32)
         y_test = np.zeros((0,), dtype=np.int64)
+        r_test = np.zeros((0,), dtype=np.float32)
 
     # Verify channels match the encoder config; auto-adjust encoder if needed.
     got_channels = int(x_train.shape[2])
@@ -557,6 +880,32 @@ def train_from_ohlcv(
 
     train_ds = WindowDataset(x_train, y_train)
     test_ds = WindowDataset(x_test, y_test) if len(x_test) else None
+
+    # ── RetCon: build return-stratified dataset + sampler ────────────────────
+    if train_cfg.loss == "retcon":
+        k_per_bin = max(2, int(train_cfg.batch_size // max(1, train_cfg.retcon_n_bins)))
+        retcon_train_ds = WindowDatasetWithReturn(x_train, y_train, r_train)
+        retcon_test_ds = WindowDatasetWithReturn(x_test, y_test, r_test) if len(x_test) else None
+        retcon_sampler = ReturnBinSampler(
+            r_train,
+            n_bins=train_cfg.retcon_n_bins,
+            samples_per_bin=k_per_bin,
+            seed=train_cfg.seed,
+        )
+        effective_bs = train_cfg.retcon_n_bins * k_per_bin
+        print(
+            f"  RetCon ReturnBinSampler: {train_cfg.retcon_n_bins} bins x {k_per_bin} samples"
+            f" = batch_size={effective_bs}"
+        )
+        retcon_train_loader = DataLoader(
+            retcon_train_ds,
+            batch_sampler=retcon_sampler,
+            num_workers=train_cfg.num_workers,
+        )
+        retcon_test_loader = (
+            DataLoader(retcon_test_ds, batch_size=train_cfg.batch_size, shuffle=False, num_workers=train_cfg.num_workers)
+            if retcon_test_ds is not None else None
+        )
 
     # For SupCon we strongly prefer PK sampling so each batch has positives.
     if train_cfg.loss == "supcon" and train_cfg.use_pk_sampler:
@@ -613,7 +962,33 @@ def train_from_ohlcv(
         else None
     )
 
-    encoder = CNNEncoder(encoder_cfg)
+    encoder: CNNEncoder | TemporalTransformerEncoder
+    if getattr(train_cfg, "encoder_type", "multiscale") == "transformer":
+        tf_cfg = TransformerConfig(
+            window_size=encoder_cfg.window_size,
+            n_channels=got_channels,
+            embedding_dim=encoder_cfg.embedding_dim,
+            d_model=128,
+            n_heads=4,
+            n_layers=4,
+            dim_feedforward=256,
+            dropout=encoder_cfg.dropout,
+        )
+        encoder = TemporalTransformerEncoder(tf_cfg)
+        print(f"  [Transformer] d_model=128, heads=4, layers=4, ffn=256")
+    else:
+        encoder = CNNEncoder(encoder_cfg)
+
+    if train_cfg.loss == "retcon":
+        encoder, train_metrics = _train_encoder_retcon(
+            retcon_train_loader, retcon_test_loader, encoder, train_cfg
+        )
+        metrics: dict[str, float | str] = {
+            "train_windows": float(len(retcon_train_ds)),
+            "test_windows": float(len(retcon_test_ds)) if retcon_test_ds else 0.0,
+            **train_metrics,
+        }
+        return encoder, metrics
 
     if train_cfg.loss == "triplet":
         encoder, last_loss = _train_encoder_triplet(train_loader, encoder, train_cfg)
@@ -648,12 +1023,15 @@ def train_from_ohlcv(
     return encoder, metrics
 
 
-def save_encoder(encoder: CNNEncoder, out_path: Path) -> None:
+def save_encoder(encoder: CNNEncoder | TemporalTransformerEncoder, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Detect encoder type for clean checkpoint labeling.
+    encoder_type = "transformer" if isinstance(encoder, TemporalTransformerEncoder) else "multiscale"
     torch.save(
         {
             "config": encoder.cfg.__dict__,
             "state_dict": encoder.state_dict(),
+            "encoder_type": encoder_type,
         },
         out_path,
     )
@@ -699,7 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
         "--loss",
-        choices=("supcon", "ce", "triplet", "mse"),
+        choices=("supcon", "ce", "triplet", "mse", "retcon"),
         default=TrainConfig.loss,
         help="Training objective for the encoder.",
     )
@@ -718,6 +1096,32 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable WeightedRandomSampler (falls back to shuffle).",
     )
     parser.add_argument("--early-stop-patience", type=int, default=TrainConfig.early_stop_patience)
+    parser.add_argument(
+        "--use-hard-mining",
+        action="store_true",
+        help="Enable Batch-Hard SupCon: mine hardest positive+negative per anchor instead of all pairs.",
+    )
+    parser.add_argument(
+        "--use-atr-threshold",
+        action="store_true",
+        help="Use ATR-based dynamic labeling thresholds instead of fixed up/down thresholds.",
+    )
+    parser.add_argument("--atr-multiplier", type=float, default=TrainConfig.atr_multiplier, help="ATR multiplier for dynamic threshold.")
+    parser.add_argument("--atr-period", type=int, default=TrainConfig.atr_period, help="ATR lookback period.")
+    parser.add_argument("--dead-zone-pct", type=float, default=TrainConfig.dead_zone_pct, help="Dead zone fraction (0 = disabled).")
+    parser.add_argument(
+        "--encoder-type",
+        choices=("multiscale", "transformer"),
+        default="multiscale",
+        help="Encoder architecture: 'multiscale' (CNN) or 'transformer'.",
+    )
+    # RetCon-specific args
+    parser.add_argument("--positive-radius", type=float, default=TrainConfig.positive_radius,
+                        help="RetCon: |return_i - return_j| < radius → positive pair.")
+    parser.add_argument("--negative-margin", type=float, default=TrainConfig.negative_margin,
+                        help="RetCon: |return_i - return_j| > margin → negative pair.")
+    parser.add_argument("--retcon-n-bins", type=int, default=TrainConfig.retcon_n_bins,
+                        help="RetCon: number of return quantile bins for ReturnBinSampler.")
     parser.add_argument("--metrics-out", type=Path, default=None, help="Optional path to write metrics JSON.")
     args = parser.parse_args(argv)
 
@@ -773,6 +1177,15 @@ def main(argv: list[str] | None = None) -> int:
             pk_classes_per_batch=int(args.pk_classes_per_batch),
             use_balanced_sampler=not args.no_balanced_sampler,
             early_stop_patience=int(args.early_stop_patience),
+            use_hard_mining=args.use_hard_mining,
+            use_atr_threshold=args.use_atr_threshold,
+            atr_multiplier=float(args.atr_multiplier),
+            atr_period=int(args.atr_period),
+            dead_zone_pct=float(args.dead_zone_pct),
+            encoder_type=str(args.encoder_type),
+            positive_radius=float(args.positive_radius),
+            negative_margin=float(args.negative_margin),
+            retcon_n_bins=int(args.retcon_n_bins),
         ),
     )
     save_encoder(encoder, args.out)

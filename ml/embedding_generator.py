@@ -21,7 +21,7 @@ import torch
 from dotenv import load_dotenv
 
 from etl.feature_engineer import WindowRecord, generate_windows
-from ml.cnn_encoder import CNNEncoder, EncoderConfig, LegacyCNNEncoder, LegacyEncoderConfig, encode_batch
+from ml.cnn_encoder import CNNEncoder, EncoderConfig, LegacyCNNEncoder, LegacyEncoderConfig, encode_batch, TemporalTransformerEncoder, TransformerConfig
 
 
 @dataclass(frozen=True)
@@ -47,16 +47,24 @@ def _format_vector(vec: np.ndarray) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec.tolist()) + "]"
 
 
-def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder | torch.nn.Module:
+def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder | TemporalTransformerEncoder | torch.nn.Module:
     payload = torch.load(model_path, map_location="cpu")
     state_dict = payload.get("state_dict", {})
     cfg_dict = payload.get("config", {}) if isinstance(payload, dict) else {}
+    encoder_type = payload.get("encoder_type", "") if isinstance(payload, dict) else ""
 
     keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
+
+    # Detect Transformer by encoder_type field or by characteristic keys.
+    is_transformer = encoder_type == "transformer" or any(k.startswith("input_proj.") for k in keys)
     is_multiscale = any(k.startswith("branch_macro.") for k in keys)
     is_legacy = any(k.startswith("net.") for k in keys)
-    
-    if is_multiscale:
+
+    if is_transformer:
+        cfg = TransformerConfig(**{k: v for k, v in cfg_dict.items() if k in TransformerConfig.__dataclass_fields__}) if cfg_dict else TransformerConfig()
+        model = TemporalTransformerEncoder(cfg)
+        model.load_state_dict(state_dict)
+    elif is_multiscale:
         from ml.cnn_encoder import MultiScaleCNNEncoder
         cfg = LegacyEncoderConfig(**cfg_dict) if cfg_dict else LegacyEncoderConfig()
         model = MultiScaleCNNEncoder(cfg)
@@ -69,9 +77,10 @@ def load_encoder(model_path: Path) -> CNNEncoder | LegacyCNNEncoder | torch.nn.M
         cfg = EncoderConfig(**cfg_dict) if cfg_dict else EncoderConfig()
         model = CNNEncoder(cfg)
         model.load_state_dict(state_dict)
-        
+
     model.eval()
     return model
+
 
 
 def fetch_ohlcv(

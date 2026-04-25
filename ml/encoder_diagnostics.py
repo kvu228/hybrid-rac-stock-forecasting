@@ -114,6 +114,7 @@ def _knn_one(
     k: int,
     overfetch: int,
     leakage_days: int,
+    similarity_threshold: float = -1.0,
 ) -> list[tuple[int, datetime, int | None]]:
     """Trả về top-k rows (sau khi loại self + rò rỉ gần thời điểm query).
 
@@ -130,10 +131,11 @@ def _knn_one(
                pe.symbol,
                (pe.embedding <=> %(qv)s::vector) AS cos_dist
         FROM pattern_embeddings pe
+        WHERE 1 - (pe.embedding <=> %(qv)s::vector) >= %(sim)s
         ORDER BY pe.embedding <=> %(qv)s::vector
         LIMIT %(limit)s
         """,
-        {"qv": qv, "limit": int(k + overfetch)},
+        {"qv": qv, "limit": int(k + overfetch), "sim": float(similarity_threshold)},
     ).fetchall()
 
     kept: list[tuple[int, datetime, int | None]] = []
@@ -340,6 +342,7 @@ def run_diagnostics(
     pca_per_label: int,
     seed: int,
     out_dir: Path,
+    similarity_threshold: float = -1.0,
 ) -> dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -390,6 +393,7 @@ def run_diagnostics(
                 k=k,
                 overfetch=20,
                 leakage_days=leakage_days,
+                similarity_threshold=similarity_threshold,
             )
             labels_only = [lab for (_id, _wend, lab) in rows if lab is not None]
             results.append(QueryNeighborResult(query_label=int(rec.label), neighbor_labels=labels_only))
@@ -433,6 +437,7 @@ def run_diagnostics(
         "k": k,
         "n_queries": len(queries),
         "leakage_days": leakage_days,
+        "similarity_threshold": similarity_threshold,
         "retrieval_counts": counts.tolist(),
         "retrieval_fractions": fractions.tolist(),
         "retrieval_lift": [
@@ -486,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--pca-per-label", type=int, default=3000)
+    parser.add_argument("--similarity-threshold", type=float, default=-1.0, help="Minimum cosine similarity (-1.0 to disable).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=Path, default=Path("ml/diagnostics"))
     args = parser.parse_args(argv)
@@ -514,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         pca_per_label=int(args.pca_per_label),
         seed=int(args.seed),
         out_dir=args.out_dir,
+        similarity_threshold=float(args.similarity_threshold),
     )
     return 0
 

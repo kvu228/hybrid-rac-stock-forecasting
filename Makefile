@@ -38,17 +38,29 @@ SR_ORDER ?= 5
 ML_ENCODER_OUT ?= ml/model_store/cnn_encoder.pt
 OHLCV_TSV ?= tests/fixtures/ohlcv_small.tsv
 # DB-scale training defaults (VN100 / full history): retrieval-first SupCon profile
-ML_ENCODER_EPOCHS ?= 60
+ML_ENCODER_EPOCHS ?= 100
 ML_ENCODER_BATCH ?= 512
 ML_LR ?= 0.0003
-ML_LOSS ?= mse
-ML_SUPCON_TEMP ?= 0.2
-ML_SUPCON_CE ?= 0.2
-ML_ES_PATIENCE ?= 15
+ML_LOSS ?= supcon
+ML_SUPCON_TEMP ?= 0.07
+ML_SUPCON_CE ?= 0.5
+ML_ES_PATIENCE ?= 20
+# Hard-mining: disabled (causes gradient collapse at early training)
+ML_HARD_MINING ?= 0
+# ATR-based dynamic labeling: disabled (fixed ±4% threshold is cleaner)
+ML_ATR_THRESHOLD ?= 0
+ML_ATR_MULT ?= 1.5
+ML_DEAD_ZONE ?= 0
+# RetCon: Return-Continuous SupCon parameters
+ML_POS_RADIUS ?= 0.01
+ML_NEG_MARGIN ?= 0.03
+ML_RETCON_N_BINS ?= 10
 # Small TSV smoke training (fixture): keep fast defaults separate from DB training
 ML_TSV_TRAIN_EPOCHS ?= 8
 ML_DEVICE ?= auto
 ML_EMBED_BATCH ?= 512
+# Encoder architecture: "multiscale" (CNN best) or "transformer"
+ML_ENCODER_TYPE ?= multiscale
 
 # Phase 6: DB benchmarks (require DATABASE_URL; HNSW scripts DROP/CREATE idx_embedding_hnsw)
 BENCH_K ?= 20
@@ -270,6 +282,14 @@ ml-train-encoder-db:
 		--supcon-temperature $(ML_SUPCON_TEMP) \
 		--supcon-ce-weight $(ML_SUPCON_CE) \
 		--early-stop-patience $(ML_ES_PATIENCE) \
+		$(if $(filter 1,$(ML_HARD_MINING)),--use-hard-mining,) \
+		$(if $(filter 1,$(ML_ATR_THRESHOLD)),--use-atr-threshold,) \
+		--atr-multiplier $(ML_ATR_MULT) \
+		--dead-zone-pct $(ML_DEAD_ZONE) \
+		--encoder-type $(ML_ENCODER_TYPE) \
+		--positive-radius $(ML_POS_RADIUS) \
+		--negative-margin $(ML_NEG_MARGIN) \
+		--retcon-n-bins $(ML_RETCON_N_BINS) \
 		--out $(ML_ENCODER_OUT) \
 		--device $(ML_DEVICE)
 
@@ -325,6 +345,7 @@ DIAG_N_QUERIES ?= 2000
 DIAG_LEAKAGE_DAYS ?= 45
 DIAG_PCA_PER_LABEL ?= 3000
 DIAG_OUT ?= ml/diagnostics
+DIAG_SIM_THRESH ?= -1.0
 
 .PHONY: ml-diag-encoder
 ml-diag-encoder:
@@ -337,6 +358,7 @@ ml-diag-encoder:
 		--n-queries $(DIAG_N_QUERIES) \
 		--leakage-days $(DIAG_LEAKAGE_DAYS) \
 		--pca-per-label $(DIAG_PCA_PER_LABEL) \
+		--similarity-threshold $(DIAG_SIM_THRESH) \
 		--device $(ML_DEVICE) \
 		--out-dir $(DIAG_OUT)
 

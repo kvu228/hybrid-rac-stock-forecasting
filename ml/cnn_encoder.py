@@ -20,7 +20,7 @@ Output is L2-normalized so pgvector cosine distance is well-behaved.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -39,6 +39,20 @@ class EncoderConfig:
     use_positional_encoding: bool = True
 
 
+@dataclass(frozen=True)
+class TransformerConfig:
+    """Config for TemporalTransformerEncoder."""
+    window_size: int = 30
+    n_channels: int = 6          # input feature channels (OHLCV + close_ret)
+    embedding_dim: int = 128     # output embedding dimension
+    d_model: int = 128           # internal transformer width
+    n_heads: int = 4             # attention heads (d_model must be divisible)
+    n_layers: int = 4            # number of TransformerEncoder layers
+    dim_feedforward: int = 256   # FFN hidden size (2x d_model)
+    dropout: float = 0.1
+    use_positional_encoding: bool = True
+
+
 def _build_sinusoidal_pe(length: int, dim: int) -> torch.Tensor:
     """Standard transformer-style sinusoidal positional encoding, shape ``(length, dim)``."""
     pe = torch.zeros(length, dim)
@@ -54,10 +68,10 @@ def _build_sinusoidal_pe(length: int, dim: int) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class LegacyEncoderConfig:
-    """Legacy config for the v1 encoder (mean pooling, 5 channels)."""
+    """Config for MultiScaleCNNEncoder (6 channels: OHLCV + close_ret)."""
 
     window_size: int = 30
-    n_channels: int = 5
+    n_channels: int = 6
     embedding_dim: int = 128
     conv_channels: tuple[int, int, int] = (32, 64, 128)
     kernel_size: int = 3
@@ -238,6 +252,106 @@ class MultiScaleCNNEncoder(nn.Module):
         return nn.functional.normalize(z, p=2.0, dim=1)
 
 
+class TemporalTransformerEncoder(nn.Module):
+    """Pure Transformer encoder for financial time-series windows.
+
+    Architecture:
+      1. **Patch projection**: Linear(n_channels → d_model) applied per time-step
+         (no convolution — every day is a "token").
+      2. **CLS token**: A learnable [CLS] vector prepended to the sequence;
+         its final hidden state is used as the sequence summary.
+      3. **Sinusoidal PE**: Added to time-step tokens (not CLS) to encode order.
+      4. **Transformer layers**: N × Pre-Norm TransformerEncoderLayer with
+         multi-head self-attention + FFN.  Pre-norm (norm_first=True) is more
+         stable than post-norm for shorter sequences.
+      5. **Projection head**: CLS hidden state → MLP → embedding_dim, L2-norm.
+
+    Compared to MultiScaleCNN:
+      - Full receptive field from layer 1 (attention is global).
+      - Learns which time-steps are important (dynamic, not fixed pooling).
+      - Position-aware via PE: distinguishes "recent" vs "historical" days.
+    """
+
+    def __init__(self, cfg: TransformerConfig = TransformerConfig()) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        # Input projection: each day (n_channels) → d_model token
+        self.input_proj = nn.Linear(cfg.n_channels, cfg.d_model)
+
+        # Learnable CLS token (prepended at position 0)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # Sinusoidal positional encoding for time-step tokens (not CLS)
+        if cfg.use_positional_encoding:
+            pe = _build_sinusoidal_pe(cfg.window_size, cfg.d_model)  # (T, d_model)
+            self.register_buffer("pos_enc", pe, persistent=False)
+        else:
+            self.pos_enc = None  # type: ignore[assignment]
+
+        # Stack of Transformer encoder layers (pre-norm for stability)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.n_heads,
+            dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,   # Pre-LN: more stable than post-LN on short sequences
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=cfg.n_layers,
+            enable_nested_tensor=False,
+        )
+
+        # Final layer-norm on CLS output
+        self.norm = nn.LayerNorm(cfg.d_model)
+
+        # MLP projection: d_model → embedding_dim
+        self.proj = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_model, cfg.embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a batch.
+
+        Args:
+            x: Tensor of shape (B, window_size, n_channels).
+
+        Returns:
+            Embeddings of shape (B, embedding_dim), L2-normalized.
+        """
+        if x.ndim != 3:
+            raise ValueError(f"Expected 3D tensor (B, T, C), got {tuple(x.shape)}")
+        b = x.size(0)
+
+        # Project each day to d_model → (B, T, d_model)
+        tokens = self.input_proj(x)
+
+        # Add sinusoidal PE to time-step tokens
+        if self.pos_enc is not None:
+            tokens = tokens + self.pos_enc.unsqueeze(0)
+
+        # Prepend CLS token → (B, T+1, d_model)
+        cls = self.cls_token.expand(b, -1, -1)
+        seq = torch.cat([cls, tokens], dim=1)
+
+        # Transformer self-attention (all tokens attend to each other)
+        out = self.transformer(seq)                # (B, T+1, d_model)
+
+        # Extract CLS output (position 0) as sequence summary
+        cls_out = self.norm(out[:, 0, :])          # (B, d_model)
+
+        # Project to embedding space and L2-normalize
+        emb = self.proj(cls_out)                   # (B, embedding_dim)
+        return nn.functional.normalize(emb, p=2.0, dim=1)
+
+
 class CNNAutoencoder(nn.Module):
     """Autoencoder wrapper for LegacyCNNEncoder to train via reconstruction."""
 
@@ -284,7 +398,7 @@ class CNNAutoencoder(nn.Module):
 
 @torch.inference_mode()
 def encode_batch(
-    model: CNNEncoder | LegacyCNNEncoder | MultiScaleCNNEncoder,
+    model: CNNEncoder | LegacyCNNEncoder | MultiScaleCNNEncoder | TemporalTransformerEncoder,
     windows: np.ndarray,
     *,
     device: str | torch.device = "cpu",
