@@ -38,6 +38,7 @@ htmlcov/
 
 # Data / artifacts (keep real data out of git)
 data/
+db/*
 datasets/
 artifacts/
 outputs/
@@ -45,6 +46,10 @@ models/
 ml/model_store/
 reports/
 benchmark/results/
+docs/*
+
+# Local ML diagnostics outputs (plots/metrics from encoder_diagnostics)
+ml/diagnostics/
 
 # Local ML diagnostics outputs (plots/metrics from encoder_diagnostics)
 ml/diagnostics/
@@ -64,3 +69,5 @@ Thumbs.db
 *.key
 *.p12
 *.pfx
+*.doc
+*.docx

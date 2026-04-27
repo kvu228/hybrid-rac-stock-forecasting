@@ -148,8 +148,8 @@ def generate_windows(
     window_size: int = WINDOW_SIZE,
     horizon: int = LABEL_HORIZON,
     stride: int = 1,
-    up_threshold: float = 0.03,
-    down_threshold: float = -0.03,
+    up_threshold: float = 0.02,
+    down_threshold: float = -0.02,
     channels: list[str] | tuple[str, ...] = tuple(FEATURE_CHANNELS),
 ) -> list[WindowRecord]:
     """Create labeled sliding windows from cleaned OHLCV data.
