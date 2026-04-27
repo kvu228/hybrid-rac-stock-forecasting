@@ -13,7 +13,7 @@ OHLCV_CHANNELS = ["open", "high", "low", "close", "volume"]
 # explicit directional/momentum signal that z-score within-window doesn't erase).
 FEATURE_CHANNELS = ["open", "high", "low", "close", "volume", "close_ret"]
 WINDOW_SIZE = 30
-LABEL_HORIZON = 5  # T+5 forward return for labeling
+LABEL_HORIZON = 10  # T+10 forward return — wider horizon reduces path-dependency noise in triple-barrier labels
 
 
 @dataclass(frozen=True)

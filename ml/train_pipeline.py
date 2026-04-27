@@ -459,7 +459,7 @@ def train_from_ohlcv(
     if train_cfg.loss not in {"supcon", "ce", "triplet"}:
         raise ValueError("train_cfg.loss must be 'supcon', 'ce', or 'triplet'")
 
-    records = generate_windows(df)
+    records = generate_windows(df, stride=train_cfg.stride)
     train_recs, test_recs = train_test_split_by_time(records, train_ratio=train_cfg.train_ratio)
     if not train_recs:
         raise ValueError("No training windows generated; check OHLCV input range/quality.")

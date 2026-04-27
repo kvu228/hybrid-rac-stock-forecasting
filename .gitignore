@@ -51,6 +51,9 @@ docs/*
 # Local ML diagnostics outputs (plots/metrics from encoder_diagnostics)
 ml/diagnostics/
 
+# Local ML diagnostics outputs (plots/metrics from encoder_diagnostics)
+ml/diagnostics/
+
 
 # OS / IDE
 .DS_Store
